@@ -14,7 +14,7 @@ pub enum Request {
     Status,
     /// Shut the daemon down (closes the browser too).
     Shutdown,
-    Navigate { url: String },
+    Navigate { url: String, timeout_ms: Option<u64> },
     Snapshot { text_only: bool },
     Click { selector: String },
     Type { selector: String, text: String },
@@ -35,11 +35,27 @@ pub enum Request {
     Console,
     Cookies,
     LocalStorage { key: Option<String> },
-    Network,
+    Network { filter: Option<String> },
     Back,
     Forward,
     Reload,
     Close,
+    // --- new feature commands ---
+    /// Throttle network: presets offline | slow-3g | fast-3g | none
+    Throttle { preset: String },
+    /// Print page to PDF, save to path.
+    Pdf { path: String },
+    /// Inspect an element: tag, attributes, computed styles, bounding box, text.
+    Inspect { selector: String },
+    /// Get the accessibility tree as indented text.
+    Accessibility,
+    /// Export captured network requests as HAR 1.2 JSON to a file.
+    Har { path: String },
+    // --- multi-tab ---
+    TabList,
+    TabNew { url: Option<String> },
+    TabSwitch { id: String },
+    TabClose { id: String },
 }
 
 /// The daemon's reply.
@@ -73,7 +89,32 @@ pub enum Response {
     Cookies { cookies: Vec<Cookie> },
     LocalStorage { entries: Vec<(String, String)> },
     Network { entries: Vec<NetworkEntry> },
+    Pdf { path: String, size_bytes: usize },
+    Inspect { info: ElementInfo },
+    Accessibility { tree: String },
+    Har { path: String, size_bytes: usize, request_count: usize },
+    TabList { tabs: Vec<TabInfo>, active_id: String },
+    TabId { id: String, url: String },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElementInfo {
+    pub tag: String,
+    pub attributes: Vec<(String, String)>,
+    pub text: String,
+    pub bounding_box: (f64, f64, f64, f64), // x, y, width, height
+    pub computed_styles: Vec<(String, String)>,
+    pub aria_role: Option<String>,
+    pub aria_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +147,9 @@ pub struct NetworkEntry {
     pub failed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_text: Option<String>,
+    /// Response body for small JSON/text payloads (XHR/Fetch, <64KB). Absent for large or binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -208,8 +208,9 @@ fn handle_initialize(params: &Value) -> Result<Value, JsonRpcError> {
 fn handle_tools_list() -> Value {
     json!({
         "tools": [
-            tool("navigate", "Navigate the browser to a URL.", schema_obj(&[
+            tool("navigate", "Navigate the browser to a URL.", schema_obj_opt(&[
                 ("url", "string", "The URL to navigate to.", true),
+                ("timeout_ms", "number", "Navigation timeout in milliseconds.", false),
             ])),
             tool("snapshot", "Capture a screenshot (base64 PNG) + visible text + console logs + network failures. The screenshot is returned as an image content block that multimodal models can see.", schema_obj_opt(&[
                 ("text_only", "boolean", "Skip the screenshot (text + console only). For text-only models.", false),
@@ -253,11 +254,27 @@ fn handle_tools_list() -> Value {
             tool("local_storage", "Get localStorage entries (all, or a specific key).", schema_obj_opt(&[
                 ("key", "string", "Specific key to fetch. If omitted, returns all entries.", false),
             ])),
-            tool("network", "Dump all network requests (success + failure) captured since the last drain. Each entry includes method, URL, status, MIME type, size, and failure info.", schema_obj(&[])),
+            tool("network", "Dump all network requests (success + failure) captured since the last drain. Each entry includes method, URL, status, MIME type, size, and failure info.", schema_obj_opt(&[
+                ("filter", "string", "Filter requests by URL substring (e.g. /api/).", false),
+            ])),
             tool("back", "Go back in browser history.", schema_obj(&[])),
             tool("forward", "Go forward in browser history.", schema_obj(&[])),
             tool("reload", "Reload the current page.", schema_obj(&[])),
             tool("close", "Close the browser session and stop the MCP server.", schema_obj(&[])),
+            // New feature tools:
+            tool("throttle", "Throttle network conditions. Presets: offline, slow-3g, fast-3g, none.", schema_obj(&[
+                ("preset", "string", "offline, slow-3g, fast-3g, or none.", true),
+            ])),
+            tool("pdf", "Print the page to a PDF file.", schema_obj(&[
+                ("path", "string", "File path to save the PDF to.", true),
+            ])),
+            tool("inspect", "Inspect an element: tag, attributes, computed styles, bounding box, ARIA role/label.", schema_obj(&[
+                ("selector", "string", "The element selector.", true),
+            ])),
+            tool("accessibility", "Get the accessibility tree as indented text.", schema_obj(&[])),
+            tool("har", "Export captured network requests as HAR 1.2 JSON to a file.", schema_obj(&[
+                ("path", "string", "File path to save the HAR to.", true),
+            ])),
         ]
     })
 }
@@ -329,7 +346,8 @@ async fn handle_tools_call(params: &Value, state: &McpState) -> Result<Value, Js
     let resp: Response = match call.name.as_str() {
         "navigate" => {
             let url = get_str(&args, "url")?;
-            commands::navigate(page, &url).await
+            let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
+            commands::navigate(page, &url, timeout_ms).await
         }
         "snapshot" => {
             let text_only = args.get("text_only").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -408,11 +426,32 @@ async fn handle_tools_call(params: &Value, state: &McpState) -> Result<Value, Js
             let key = args.get("key").and_then(|v| v.as_str()).map(|s| s.to_string());
             commands::local_storage(page, key.as_deref()).await
         }
-        "network" => commands::network(&state.network).await,
+        "network" => {
+            let filter = args.get("filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+            commands::network(&state.network, filter.as_deref()).await
+        }
         "back" => commands::back(page).await,
         "forward" => commands::forward(page).await,
         "reload" => commands::reload(page).await,
         "close" => Response::ok("closing session"),
+        // New feature tools:
+        "throttle" => {
+            let preset = get_str(&args, "preset")?;
+            commands::throttle(page, &preset).await
+        }
+        "pdf" => {
+            let path = get_str(&args, "path")?;
+            commands::pdf(page, &path).await
+        }
+        "inspect" => {
+            let selector = get_str(&args, "selector")?;
+            commands::inspect(page, &selector).await
+        }
+        "accessibility" => commands::accessibility(page).await,
+        "har" => {
+            let path = get_str(&args, "path")?;
+            commands::har(&state.network, &path).await
+        }
         _ => {
             return Err(JsonRpcError {
                 code: -32602,
@@ -577,6 +616,49 @@ fn response_to_mcp_content(resp: &Response) -> (Vec<Value>, bool) {
             }
             (vec![json!({"type": "text", "text": text})], false)
         }
+        Response::Pdf { path, size_bytes } => (
+            vec![json!({"type": "text", "text": format!("PDF saved to {path} ({size_bytes} bytes)")})],
+            false,
+        ),
+        Response::Inspect { info } => {
+            let mut text = format!("<{}>\n", info.tag);
+            for (k, v) in &info.attributes {
+                text.push_str(&format!("  {k}=\"{v}\"\n"));
+            }
+            if !info.text.is_empty() {
+                text.push_str(&format!("Text: {}\n", info.text));
+            }
+            let bb = info.bounding_box;
+            text.push_str(&format!("BBox: x={:.0} y={:.0} w={:.0} h={:.0}\n", bb.0, bb.1, bb.2, bb.3));
+            if let Some(r) = &info.aria_role { text.push_str(&format!("Role: {r}\n")); }
+            if let Some(l) = &info.aria_label { text.push_str(&format!("Label: {l}\n")); }
+            text.push_str("Styles:\n");
+            for (k, v) in &info.computed_styles {
+                text.push_str(&format!("  {k}: {v}\n"));
+            }
+            (vec![json!({"type": "text", "text": text})], false)
+        }
+        Response::Accessibility { tree } => (
+            vec![json!({"type": "text", "text": if tree.is_empty() { "(empty accessibility tree)".to_string() } else { tree.clone() }})],
+            false,
+        ),
+        Response::Har { path, size_bytes, request_count } => (
+            vec![json!({"type": "text", "text": format!("HAR exported to {path} ({size_bytes} bytes, {request_count} requests)")})],
+            false,
+        ),
+        Response::TabList { tabs, active_id } => {
+            let mut text = format!("Tabs ({}):\n", tabs.len());
+            for t in tabs {
+                let marker = if t.active { "*" } else { " " };
+                text.push_str(&format!("{marker} {} {} {}\n", t.id, t.url, t.title));
+            }
+            text.push_str(&format!("Active: {active_id}\n"));
+            (vec![json!({"type": "text", "text": text})], false)
+        }
+        Response::TabId { id, url } => (
+            vec![json!({"type": "text", "text": format!("Tab created: {id} ({url})")})],
+            false,
+        ),
     }
 }
 

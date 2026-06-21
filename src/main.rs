@@ -52,7 +52,12 @@ enum Cmd {
     /// Stop the running daemon.
     Stop,
     /// Navigate to a URL.
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        /// Navigation timeout in milliseconds. Default: chromiumoxide's built-in.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// Capture screenshot + visible text + console logs.
     Snapshot {
         /// Skip the screenshot (text + console only). For text-only orchestrator models.
@@ -99,7 +104,11 @@ enum Cmd {
     /// Dump console logs captured since the last snapshot/console drain.
     Console,
     /// Dump all network requests (success + failure) captured since the last drain.
-    Network,
+    Network {
+        /// Filter requests by URL substring (e.g. /api/ to show only API calls).
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Get cookies for the current page.
     Cookies,
     /// Get localStorage entries (all, or one key).
@@ -115,6 +124,32 @@ enum Cmd {
     Reload,
     /// Close the session and stop the daemon.
     Close,
+    // --- new feature commands ---
+    /// Throttle network conditions. Presets: offline, slow-3g, fast-3g, none.
+    Throttle {
+        /// offline | slow-3g | fast-3g | none
+        preset: String,
+    },
+    /// Print the page to a PDF file.
+    Pdf { path: String },
+    /// Inspect an element: tag, attributes, computed styles, bounding box, ARIA.
+    Inspect { selector: String },
+    /// Get the accessibility tree as indented text.
+    Accessibility,
+    /// Export captured network requests as HAR 1.2 JSON to a file.
+    Har { path: String },
+    // --- multi-tab ---
+    /// List all open tabs.
+    TabList,
+    /// Open a new tab (optionally navigating to a URL).
+    TabNew {
+        /// URL to navigate to (default: about:blank).
+        url: Option<String>,
+    },
+    /// Switch to a tab by ID.
+    TabSwitch { id: String },
+    /// Close a tab by ID.
+    TabClose { id: String },
     /// Run as an MCP (Model Context Protocol) server over stdio. Exposes all
     /// browser commands as MCP tools for LLM clients (Claude Desktop, etc.).
     /// The snapshot tool returns screenshots as image content blocks that
@@ -201,7 +236,7 @@ fn build_request(cmd: Cmd) -> Request {
     match cmd {
         Cmd::Status => Request::Status,
         Cmd::Stop | Cmd::Close => Request::Shutdown,
-        Cmd::Navigate { url } => Request::Navigate { url },
+        Cmd::Navigate { url, timeout_ms } => Request::Navigate { url, timeout_ms },
         Cmd::Snapshot { text_only } => Request::Snapshot { text_only },
         Cmd::Click { selector } => Request::Click { selector },
         Cmd::Hover { selector } => Request::Hover { selector },
@@ -221,7 +256,7 @@ fn build_request(cmd: Cmd) -> Request {
             timeout_ms,
         },
         Cmd::Console => Request::Console,
-        Cmd::Network => Request::Network,
+        Cmd::Network { filter } => Request::Network { filter },
         Cmd::Cookies => Request::Cookies,
         Cmd::LocalStorage { key } => Request::LocalStorage { key },
         Cmd::Back => Request::Back,
@@ -229,5 +264,15 @@ fn build_request(cmd: Cmd) -> Request {
         Cmd::Reload => Request::Reload,
         Cmd::Daemon { .. } => unreachable!(),
         Cmd::Mcp => unreachable!(),
+        // New feature commands:
+        Cmd::Throttle { preset } => Request::Throttle { preset },
+        Cmd::Pdf { path } => Request::Pdf { path },
+        Cmd::Inspect { selector } => Request::Inspect { selector },
+        Cmd::Accessibility => Request::Accessibility,
+        Cmd::Har { path } => Request::Har { path },
+        Cmd::TabList => Request::TabList,
+        Cmd::TabNew { url } => Request::TabNew { url },
+        Cmd::TabSwitch { id } => Request::TabSwitch { id },
+        Cmd::TabClose { id } => Request::TabClose { id },
     }
 }

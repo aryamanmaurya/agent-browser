@@ -212,9 +212,72 @@ pub fn print_response(resp: Response) {
                             "{} {} → {} ({} {}) [{}]",
                             n.method, n.url, status, mime, size, n.resource_type
                         );
+                        if let Some(body) = &n.body {
+                            let preview = if body.len() > 200 { format!("{}...", &body[..200]) } else { body.clone() };
+                            println!("    body: {preview}");
+                        }
                     }
                 }
             }
+        }
+        Response::Pdf { path, size_bytes } => {
+            println!("=== PDF SAVED ===");
+            println!("Path: {path}");
+            println!("Size: {size_bytes} bytes");
+        }
+        Response::Inspect { info } => {
+            println!("=== ELEMENT INSPECTION ===");
+            println!("Tag: <{}>", info.tag);
+            if !info.attributes.is_empty() {
+                println!("Attributes:");
+                for (k, v) in &info.attributes {
+                    println!("  {k}=\"{v}\"");
+                }
+            }
+            if !info.text.is_empty() {
+                println!("Text: {}", info.text);
+            }
+            let bb = info.bounding_box;
+            println!("Bounding box: x={:.0} y={:.0} w={:.0} h={:.0}", bb.0, bb.1, bb.2, bb.3);
+            if let Some(role) = &info.aria_role {
+                println!("ARIA role: {role}");
+            }
+            if let Some(label) = &info.aria_label {
+                println!("ARIA label: {label}");
+            }
+            if !info.computed_styles.is_empty() {
+                println!("Computed styles:");
+                for (k, v) in &info.computed_styles {
+                    println!("  {k}: {v}");
+                }
+            }
+        }
+        Response::Accessibility { tree } => {
+            println!("=== ACCESSIBILITY TREE ===");
+            if tree.is_empty() {
+                println!("(empty)");
+            } else {
+                print!("{tree}");
+            }
+        }
+        Response::Har { path, size_bytes, request_count } => {
+            println!("=== HAR EXPORTED ===");
+            println!("Path: {path}");
+            println!("Size: {size_bytes} bytes");
+            println!("Requests: {request_count}");
+        }
+        Response::TabList { tabs, active_id } => {
+            println!("=== TABS ({}) ===", tabs.len());
+            for t in &tabs {
+                let marker = if t.active { " *" } else { "  " };
+                println!("{marker} {}  {}  {}", t.id, t.url, t.title);
+            }
+            println!("Active: {active_id}");
+        }
+        Response::TabId { id, url } => {
+            println!("=== TAB CREATED ===");
+            println!("ID: {id}");
+            println!("URL: {url}");
         }
     }
 }

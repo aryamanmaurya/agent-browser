@@ -5,11 +5,13 @@
 //! down on an idle timeout or an explicit `Shutdown`/`Close` command.
 
 use crate::commands::{self, ConsoleBuffer, NetworkBuffer};
-use crate::protocol::{read_frame, write_frame, ConsoleEntry, NetworkEntry, Request, Response};
+use crate::protocol::{read_frame, write_frame, ConsoleEntry, NetworkEntry, Request, Response, TabInfo};
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::Page;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,7 +58,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         tracing::info!("cdp handler stream ended");
     });
 
-    let page: Page = browser
+    let initial_page: Page = browser
         .new_page("about:blank")
         .await
         .map_err(|e| anyhow!("new_page failed: {e}"))?;
@@ -69,16 +71,21 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         .mobile(false)
         .build()
     {
-        let _ = page.execute(params).await;
+        let _ = initial_page.execute(params).await;
     }
 
     let console_buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
     let network_buf: NetworkBuffer = Arc::new(Mutex::new(Vec::new()));
-    spawn_console_listener(&page, console_buf.clone());
-    spawn_network_listener(&page, network_buf.clone());
+    spawn_console_listener(&initial_page, console_buf.clone());
+    spawn_network_listener(&initial_page, network_buf.clone());
+
+    // Multi-tab manager: maps tab_id → Page, tracks the active tab.
+    let tabs: Arc<Mutex<HashMap<String, Page>>> = Arc::new(Mutex::new(HashMap::new()));
+    let active_tab: Arc<Mutex<String>> = Arc::new(Mutex::new("tab-1".to_string()));
+    tabs.lock().unwrap().insert("tab-1".to_string(), initial_page.clone());
 
     if let Some(url) = &opts.initial_url {
-        let _ = page.goto(url).await;
+        let _ = initial_page.goto(url).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -118,7 +125,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             }
         };
 
-        let resp = dispatch(&req, &page, &console_buf, &network_buf, start).await;
+        let resp = dispatch(&req, &tabs, &active_tab, &console_buf, &network_buf, &browser, start).await;
         idle_deadline = Instant::now() + idle_timeout;
 
         let is_shutdown = matches!(req, Request::Shutdown | Request::Close);
@@ -141,15 +148,96 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
 async fn dispatch(
     req: &Request,
-    page: &Page,
+    tabs: &Arc<Mutex<HashMap<String, Page>>>,
+    active_tab: &Arc<Mutex<String>>,
     console: &ConsoleBuffer,
     network: &NetworkBuffer,
+    browser: &Browser,
     start: Instant,
 ) -> Response {
+    // Handle tab management requests first (they don't need an active page).
+    match req {
+        Request::TabList => {
+            let active = active_tab.lock().unwrap().clone();
+            let mut tab_infos: Vec<TabInfo> = Vec::new();
+            for (id, page) in tabs.lock().unwrap().iter() {
+                let url = commands::page_url(page).await.unwrap_or_default();
+                let title = commands::page_title(page).await.unwrap_or_default();
+                tab_infos.push(TabInfo {
+                    id: id.clone(),
+                    url,
+                    title,
+                    active: id == &active,
+                });
+            }
+            // Sort by tab id for stable ordering.
+            tab_infos.sort_by(|a, b| a.id.cmp(&b.id));
+            return Response::TabList { tabs: tab_infos, active_id: active };
+        }
+        Request::TabNew { url } => {
+            let id = format!("tab-{}", tabs.lock().unwrap().len() + 1);
+            match browser.new_page("about:blank").await {
+                Ok(page) => {
+                    // Set viewport on the new tab.
+                    if let Ok(params) = chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::builder()
+                        .width(1280_i64).height(800_i64).device_scale_factor(1.0_f64).mobile(false).build()
+                    {
+                        let _ = page.execute(params).await;
+                    }
+                    // Attach listeners to the new tab (shared buffers).
+                    spawn_console_listener(&page, console.clone());
+                    spawn_network_listener(&page, network.clone());
+                    if let Some(u) = url {
+                        let _ = page.goto(u).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    tabs.lock().unwrap().insert(id.clone(), page);
+                    *active_tab.lock().unwrap() = id.clone();
+                    return Response::TabId { id, url: url.clone().unwrap_or_else(|| "about:blank".to_string()) };
+                }
+                Err(e) => return Response::err(format!("tab-new failed: {e}")),
+            }
+        }
+        Request::TabSwitch { id } => {
+            if tabs.lock().unwrap().contains_key(id) {
+                *active_tab.lock().unwrap() = id.clone();
+                return Response::ok(format!("switched to tab {id}"));
+            }
+            return Response::err(format!("tab not found: {id}"));
+        }
+        Request::TabClose { id } => {
+            let mut tabs_guard = tabs.lock().unwrap();
+            if let Some(_page) = tabs_guard.remove(id) {
+                // page.close() takes ownership and we can't call it on a cloned
+                // Page easily; rely on the browser to clean up when the Page is
+                // dropped. This is a best-effort close.
+                let active = active_tab.lock().unwrap().clone();
+                if active == *id {
+                    let next = tabs_guard.keys().next().cloned();
+                    *active_tab.lock().unwrap() = next.unwrap_or_default();
+                }
+                return Response::ok(format!("closed tab {id}"));
+            }
+            return Response::err(format!("tab not found: {id}"));
+        }
+        _ => {}
+    }
+
+    // For all other requests, get the active page.
+    let active_id = active_tab.lock().unwrap().clone();
+    let page = {
+        let tabs_guard = tabs.lock().unwrap();
+        tabs_guard.get(&active_id).cloned()
+    };
+    let page = match page {
+        Some(p) => p,
+        None => return Response::err(format!("no active tab (active_id={active_id})")),
+    };
+
     match req {
         Request::Status => {
-            let url = commands::page_url(page).await.unwrap_or_default();
-            let viewport = commands::page_viewport(page).await.unwrap_or((1280, 800));
+            let url = commands::page_url(&page).await.unwrap_or_default();
+            let viewport = commands::page_viewport(&page).await.unwrap_or((1280, 800));
             Response::Status {
                 url,
                 viewport,
@@ -158,28 +246,36 @@ async fn dispatch(
             }
         }
         Request::Shutdown | Request::Close => Response::ok("shutting down"),
-        Request::Navigate { url } => commands::navigate(page, url).await,
-        Request::Snapshot { text_only } => commands::snapshot(page, console, network, *text_only).await,
-        Request::Click { selector } => commands::click(page, selector).await,
-        Request::Hover { selector } => commands::hover(page, selector).await,
-        Request::Type { selector, text } => commands::type_text(page, selector, text).await,
-        Request::Press { key } => commands::press(page, key).await,
-        Request::Scroll { direction, amount } => commands::scroll(page, direction, *amount).await,
-        Request::Select { selector, value } => commands::select_option(page, selector, value).await,
-        Request::Resize { width, height } => commands::resize(page, *width, *height).await,
-        Request::ViewportPreset { preset } => commands::viewport_preset(page, preset).await,
+        Request::Navigate { url, timeout_ms } => commands::navigate(&page, url, *timeout_ms).await,
+        Request::Snapshot { text_only } => commands::snapshot(&page, console, network, *text_only).await,
+        Request::Click { selector } => commands::click(&page, selector).await,
+        Request::Hover { selector } => commands::hover(&page, selector).await,
+        Request::Type { selector, text } => commands::type_text(&page, selector, text).await,
+        Request::Press { key } => commands::press(&page, key).await,
+        Request::Scroll { direction, amount } => commands::scroll(&page, direction, *amount).await,
+        Request::Select { selector, value } => commands::select_option(&page, selector, value).await,
+        Request::Resize { width, height } => commands::resize(&page, *width, *height).await,
+        Request::ViewportPreset { preset } => commands::viewport_preset(&page, preset).await,
         Request::WaitFor {
             wait_kind,
             target,
             timeout_ms,
-        } => commands::wait_for(page, wait_kind, target, *timeout_ms).await,
+        } => commands::wait_for(&page, wait_kind, target, *timeout_ms).await,
         Request::Console => commands::console(console).await,
-        Request::Cookies => commands::cookies(page).await,
-        Request::LocalStorage { key } => commands::local_storage(page, key.as_deref()).await,
-        Request::Network => commands::network(network).await,
-        Request::Back => commands::back(page).await,
-        Request::Forward => commands::forward(page).await,
-        Request::Reload => commands::reload(page).await,
+        Request::Cookies => commands::cookies(&page).await,
+        Request::LocalStorage { key } => commands::local_storage(&page, key.as_deref()).await,
+        Request::Network { filter } => commands::network(network, filter.as_deref()).await,
+        Request::Back => commands::back(&page).await,
+        Request::Forward => commands::forward(&page).await,
+        Request::Reload => commands::reload(&page).await,
+        // --- new feature commands ---
+        Request::Throttle { preset } => commands::throttle(&page, preset).await,
+        Request::Pdf { path } => commands::pdf(&page, path).await,
+        Request::Inspect { selector } => commands::inspect(&page, selector).await,
+        Request::Accessibility => commands::accessibility(&page).await,
+        Request::Har { path } => commands::har(network, path).await,
+        // Tab management handled above.
+        Request::TabList | Request::TabNew { .. } | Request::TabSwitch { .. } | Request::TabClose { .. } => unreachable!(),
     }
 }
 
@@ -225,6 +321,7 @@ pub fn spawn_network_listener(page: &Page, buf: NetworkBuffer) {
                         encoded_size: None,
                         failed: false,
                         error_text: None,
+                        body: None,
                     };
                     commands::push_network_entry(&buf1, entry);
                 }
@@ -253,16 +350,54 @@ pub fn spawn_network_listener(page: &Page, buf: NetworkBuffer) {
             tracing::warn!("failed to subscribe to EventResponseReceived");
         }
 
-        // loadingFinished → record size
+        // loadingFinished → record size + capture body for small JSON/text
         if let Ok(mut events) = page_clone.event_listener::<EventLoadingFinished>().await {
             let buf3 = buf.clone();
+            let page_for_body = page_clone.clone();
             tokio::spawn(async move {
+                use chromiumoxide::cdp::browser_protocol::network::GetResponseBodyParams;
                 while let Some(ev) = events.next().await {
                     let rid = ev.request_id.inner().clone();
                     let size = ev.encoded_data_length as i64;
                     commands::update_network_entry(&buf3, &rid, |e| {
                         e.encoded_size = Some(size);
                     });
+                    // Capture response body for small JSON/text XHR/Fetch responses.
+                    // Check if this entry is JSON/text and small enough.
+                    let should_capture = {
+                        let buf_lock = buf3.lock().unwrap();
+                        buf_lock.iter().find(|e| e.request_id == rid).map(|e| {
+                            let is_text = e.mime_type.as_deref()
+                                .map(|m| m.contains("json") || m.contains("text") || m.contains("javascript"))
+                                .unwrap_or(false);
+                            let is_xhr = e.resource_type.contains("Fetch") || e.resource_type.contains("Xhr")
+                                || e.resource_type.contains("Document");
+                            let small = e.encoded_size.map(|s| s < 65_536).unwrap_or(false);
+                            is_text && is_xhr && small && !e.failed
+                        }).unwrap_or(false)
+                    };
+                    if should_capture {
+                        if let Ok(resp) = page_for_body.execute(GetResponseBodyParams::new(
+                            chromiumoxide::cdp::browser_protocol::network::RequestId::new(rid.clone()),
+                        )).await {
+                            let body = if resp.base64_encoded {
+                                match base64::engine::general_purpose::STANDARD.decode(&resp.body) {
+                                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                                    Err(_) => format!("<binary {} bytes>", resp.body.len()),
+                                }
+                            } else {
+                                resp.body.clone()
+                            };
+                            let truncated = if body.len() > 4096 {
+                                format!("{}... [truncated]", &body[..4096])
+                            } else {
+                                body
+                            };
+                            commands::update_network_entry(&buf3, &rid, |e| {
+                                e.body = Some(truncated);
+                            });
+                        }
+                    }
                 }
             });
         } else {

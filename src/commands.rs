@@ -6,6 +6,7 @@
 use crate::protocol::{ConsoleEntry, Cookie, NetworkEntry, Response};
 use crate::selector::{js_quote, resolve, Resolved};
 use anyhow::Result;
+use serde_json::json;
 use base64::Engine;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
@@ -23,15 +24,20 @@ pub type NetworkBuffer = Arc<Mutex<Vec<NetworkEntry>>>;
 /// Cap the network buffer to prevent unbounded growth on heavy pages.
 const NETWORK_BUFFER_CAP: usize = 1000;
 
-pub async fn navigate(page: &Page, url: &str) -> Response {
-    match page.goto(url).await {
-        Ok(_) => {
-            // Settle: wait a beat for any SPA rendering.
+pub async fn navigate(page: &Page, url: &str, timeout_ms: Option<u64>) -> Response {
+    let goto_fut = page.goto(url);
+    let result = match timeout_ms {
+        Some(ms) => tokio::time::timeout(Duration::from_millis(ms), goto_fut).await,
+        None => Ok(goto_fut.await),
+    };
+    match result {
+        Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = page.evaluate("(() => null)").await;
             Response::ok(format!("navigated to {}", url))
         }
-        Err(e) => Response::err(format!("navigate failed: {e}")),
+        Ok(Err(e)) => Response::err(format!("navigate failed: {e}")),
+        Err(_) => Response::err(format!("navigate timed out after {}ms", timeout_ms.unwrap_or(0))),
     }
 }
 
@@ -296,14 +302,18 @@ pub async fn console(console: &ConsoleBuffer) -> Response {
     Response::Console { entries: drain_console(console) }
 }
 
-pub async fn network(network: &NetworkBuffer) -> Response {
+pub async fn network(network: &NetworkBuffer, filter: Option<&str>) -> Response {
     let entries = {
         let mut buf = network.lock().unwrap();
         let drained = buf.clone();
         buf.clear();
         drained
     };
-    Response::Network { entries }
+    let filtered = match filter {
+        Some(f) => entries.into_iter().filter(|e| e.url.contains(f)).collect(),
+        None => entries,
+    };
+    Response::Network { entries: filtered }
 }
 
 pub async fn cookies(page: &Page) -> Response {
@@ -456,5 +466,268 @@ async fn run_js(page: &Page, script: &str, label: &str) -> Response {
     match page.evaluate(script).await {
         Ok(_) => Response::ok(label.to_string()),
         Err(e) => Response::err(format!("{label} failed: {e}")),
+    }
+}
+
+// ==================== NEW FEATURE COMMANDS ====================
+
+/// Throttle network conditions. Presets: offline, slow-3g, fast-3g, none.
+pub async fn throttle(page: &Page, preset: &str) -> Response {
+    use chromiumoxide::cdp::browser_protocol::network::EmulateNetworkConditionsParams;
+    let (offline, latency, dl, ul) = match preset {
+        "offline" => (true, 0.0, 0.0, 0.0),
+        "slow-3g" => (false, 400.0, 50_000.0, 20_000.0),  // ~400ms latency, 50KB/s down
+        "fast-3g" => (false, 150.0, 250_000.0, 100_000.0), // ~150ms, 250KB/s down
+        "none" => (false, 0.0, -1.0, -1.0), // -1 disables throttling
+        other => return Response::err(format!("unknown throttle preset: {other} (use: offline, slow-3g, fast-3g, none)")),
+    };
+    match EmulateNetworkConditionsParams::builder()
+        .offline(offline)
+        .latency(latency)
+        .download_throughput(dl)
+        .upload_throughput(ul)
+        .build()
+    {
+        Ok(params) => match page.execute(params).await {
+            Ok(_) => Response::ok(format!("network throttled: {preset}")),
+            Err(e) => Response::err(format!("throttle failed: {e}")),
+        },
+        Err(e) => Response::err(format!("throttle params error: {e}")),
+    }
+}
+
+/// Print the page to PDF and save to path.
+pub async fn pdf(page: &Page, path: &str) -> Response {
+    use chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams;
+    let params = PrintToPdfParams::builder()
+        .print_background(true)
+        .build();
+    match page.pdf(params).await {
+        Ok(bytes) => {
+            match std::fs::write(path, &bytes) {
+                Ok(_) => Response::Pdf { path: path.to_string(), size_bytes: bytes.len() },
+                Err(e) => Response::err(format!("failed to write PDF: {e}")),
+            }
+        }
+        Err(e) => Response::err(format!("PDF generation failed: {e}")),
+    }
+}
+
+/// Inspect an element: tag, attributes, computed styles, bounding box, text, ARIA.
+pub async fn inspect(page: &Page, selector: &str) -> Response {
+    let expr = match resolve(selector) {
+        Resolved::Css(css) => format!("document.querySelector({})", js_quote(&css)),
+        Resolved::Js(expr) => expr,
+    };
+    // Serialize element info via JS, then return as ElementInfo.
+    let script = format!(
+        "(() => {{\
+           const el = {expr};\
+           if (!el) throw new Error('element not found');\
+           const rect = el.getBoundingClientRect();\
+           const cs = window.getComputedStyle(el);\
+           const styles = ['display','visibility','position','color','background-color','font-size',\
+                           'width','height','margin','padding','border','opacity','z-index']\
+             .map(p => [p, cs.getPropertyValue(p)]);\
+           const attrs = Array.from(el.attributes).map(a => [a.name, a.value]);\
+           return JSON.stringify({{\
+             tag: el.tagName,\
+             attributes: attrs,\
+             text: (el.innerText || '').slice(0, 500),\
+             bbox: [rect.x, rect.y, rect.width, rect.height],\
+             styles: styles,\
+             role: el.getAttribute('role'),\
+             label: el.getAttribute('aria-label')\
+           }});\
+         }})()"
+    );
+    match page.evaluate(script.as_str()).await {
+        Ok(v) => {
+            let json: String = v.into_value().unwrap_or_default();
+            match serde_json::from_str::<serde_json::Value>(&json) {
+                Ok(val) => {
+                    let tag = val["tag"].as_str().unwrap_or("").to_string();
+                    let attributes = val["attributes"].as_array()
+                        .map(|arr| arr.iter().filter_map(|a| {
+                            let arr = a.as_array()?;
+                            Some((arr[0].as_str()?.to_string(), arr[1].as_str()?.to_string()))
+                        }).collect())
+                        .unwrap_or_default();
+                    let text = val["text"].as_str().unwrap_or("").to_string();
+                    let bbox = val["bbox"].as_array()
+                        .map(|arr| {
+                            let f: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
+                            if f.len() == 4 { (f[0], f[1], f[2], f[3]) } else { (0.0, 0.0, 0.0, 0.0) }
+                        })
+                        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    let computed_styles = val["styles"].as_array()
+                        .map(|arr| arr.iter().filter_map(|a| {
+                            let arr = a.as_array()?;
+                            Some((arr[0].as_str()?.to_string(), arr[1].as_str()?.to_string()))
+                        }).collect())
+                        .unwrap_or_default();
+                    let aria_role = val["role"].as_str().map(|s| s.to_string());
+                    let aria_label = val["label"].as_str().map(|s| s.to_string());
+                    Response::Inspect {
+                        info: crate::protocol::ElementInfo {
+                            tag,
+                            attributes,
+                            text,
+                            bounding_box: bbox,
+                            computed_styles,
+                            aria_role,
+                            aria_label,
+                        },
+                    }
+                }
+                Err(e) => Response::err(format!("inspect parse error: {e}")),
+            }
+        }
+        Err(e) => Response::err(format!("inspect failed: {e}")),
+    }
+}
+
+/// Get the accessibility tree as indented text.
+/// Uses a JS-based approach that walks the DOM and computes ARIA roles,
+/// rather than CDP's Accessibility.getFullAXTree (which returns "uninteresting"
+/// on some Chrome/chromiumoxide version combos).
+pub async fn accessibility(page: &Page) -> Response {
+    // JS that walks the DOM and produces a flat list of {role, name, level} entries.
+    let script = r#"(() => {
+        const result = [];
+        const implicitRoles = {
+            A: 'link', BUTTON: 'button', INPUT: 'textbox', SELECT: 'listbox',
+            TEXTAREA: 'textbox', IMG: 'image', H1: 'heading', H2: 'heading',
+            H3: 'heading', H4: 'heading', H5: 'heading', H6: 'heading',
+            NAV: 'navigation', MAIN: 'main', ASIDE: 'complementary',
+            HEADER: 'banner', FOOTER: 'contentinfo', SECTION: 'region',
+            ARTICLE: 'article', FORM: 'form', UL: 'list', OL: 'list', LI: 'listitem',
+            TABLE: 'table', TR: 'row', TH: 'columnheader', TD: 'cell',
+            FIELDSET: 'group', LEGEND: 'legend', LABEL: 'label',
+            DIALOG: 'dialog', DETAILS: 'group', SUMMARY: 'button',
+            PROGRESS: 'progressbar', METER: 'meter', CANVAS: 'canvas',
+            SVG: 'img', FIGURE: 'figure', FIGCAPTION: 'caption',
+            BLOCKQUOTE: 'blockquote', CODE: 'code', TIME: 'time',
+        };
+        function getRole(el) {
+            const explicit = el.getAttribute('role');
+            if (explicit) return explicit;
+            const tag = el.tagName;
+            return implicitRoles[tag] || null;
+        }
+        function getName(el, role) {
+            // ARIA naming order: aria-label, aria-labelledby, text content, title, placeholder
+            const ariaLabel = el.getAttribute('aria-label');
+            if (ariaLabel) return ariaLabel;
+            const title = el.getAttribute('title');
+            if (title) return title;
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                const ph = el.getAttribute('placeholder');
+                if (ph) return ph;
+            }
+            const text = (el.innerText || el.textContent || '').trim();
+            if (text && text.length < 200) return text;
+            return '';
+        }
+        function walk(el, depth) {
+            if (el.nodeType !== 1) return;
+            const tag = el.tagName;
+            if (['SCRIPT','STYLE','NOSCRIPT','TEMPLATE'].includes(tag)) return;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return;
+            const role = getRole(el);
+            if (role) {
+                const name = getName(el, role);
+                let entry = { role, name: name, depth: depth };
+                if (tag === 'INPUT') {
+                    const t = el.getAttribute('type') || 'text';
+                    entry.role = t === 'checkbox' ? 'checkbox' : t === 'radio' ? 'radio' : t === 'button' || t === 'submit' ? 'button' : 'textbox';
+                    entry.type = t;
+                }
+                result.push(entry);
+            }
+            for (const child of el.children) {
+                walk(child, depth + (role ? 1 : 0));
+            }
+        }
+        walk(document.body, 0);
+        return JSON.stringify(result);
+    })()"#;
+    match page.evaluate(script).await {
+        Ok(v) => {
+            let json: String = v.into_value().unwrap_or_else(|_| "[]".to_string());
+            let entries: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_default();
+            let mut tree = String::new();
+            for entry in &entries {
+                let role = entry["role"].as_str().unwrap_or("");
+                let name = entry["name"].as_str().unwrap_or("");
+                let depth = entry["depth"].as_i64().unwrap_or(0) as usize;
+                let indent = "  ".repeat(depth);
+                if !name.is_empty() {
+                    tree.push_str(&format!("{indent}{role}: \"{name}\"\n"));
+                } else {
+                    tree.push_str(&format!("{indent}{role}\n"));
+                }
+            }
+            Response::Accessibility { tree }
+        }
+        Err(e) => Response::err(format!("accessibility tree failed: {e}")),
+    }
+}
+
+/// Export captured network requests as HAR 1.2 JSON to a file.
+pub async fn har(network: &NetworkBuffer, path: &str) -> Response {
+    let entries = {
+        let buf = network.lock().unwrap();
+        let drained = buf.clone();
+        // NOTE: do NOT clear — HAR export is read-only, unlike `network` command.
+        drained
+    };
+
+    let har_entries: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "request": {
+                    "method": e.method,
+                    "url": e.url,
+                    "headers": [],
+                },
+                "response": {
+                    "status": e.status.unwrap_or(0),
+                    "statusText": e.status_text.clone().unwrap_or_default(),
+                    "content": {
+                        "mimeType": e.mime_type.clone().unwrap_or_default(),
+                        "size": e.encoded_size.unwrap_or(0),
+                        "text": e.body.clone().unwrap_or_default(),
+                    },
+                },
+                "resourceType": e.resource_type,
+                "failed": e.failed,
+                "error": e.error_text.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    let har = json!({
+        "log": {
+            "version": "1.2",
+            "creator": {
+                "name": "agent-browser",
+                "version": "0.2.0"
+            },
+            "entries": har_entries,
+        }
+    });
+
+    let json_str = serde_json::to_string_pretty(&har).unwrap_or_default();
+    let size = json_str.len();
+    match std::fs::write(path, &json_str) {
+        Ok(_) => Response::Har {
+            path: path.to_string(),
+            size_bytes: size,
+            request_count: entries.len(),
+        },
+        Err(e) => Response::err(format!("failed to write HAR: {e}")),
     }
 }
