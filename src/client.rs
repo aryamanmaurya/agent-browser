@@ -107,6 +107,7 @@ pub fn print_response(resp: Response) {
             screenshot_b64,
             text,
             console,
+            network_failures,
             viewport,
             url,
             title,
@@ -121,6 +122,15 @@ pub fn print_response(resp: Response) {
                 println!("=== CONSOLE (since last snapshot) ===");
                 for e in &console {
                     println!("[{}] {} ({})", e.level, e.text, e.source);
+                }
+            }
+            if network_failures.is_empty() {
+                println!("=== NETWORK FAILURES (none) ===");
+            } else {
+                println!("=== NETWORK FAILURES ===");
+                for n in &network_failures {
+                    let err = n.error_text.as_deref().unwrap_or("unknown");
+                    println!("{} {} → FAILED ({})", n.method, n.url, err);
                 }
             }
             println!("=== VISIBLE TEXT ===");
@@ -176,6 +186,33 @@ pub fn print_response(resp: Response) {
                         v.clone()
                     };
                     println!("{k} = {vdisplay}");
+                }
+            }
+        }
+        Response::Network { entries } => {
+            if entries.is_empty() {
+                println!("=== NETWORK (empty) ===");
+            } else {
+                println!("=== NETWORK ({} requests) ===", entries.len());
+                for n in &entries {
+                    if n.failed {
+                        let err = n.error_text.as_deref().unwrap_or("unknown");
+                        println!(
+                            "{} {} → FAILED ({}) [{}]",
+                            n.method, n.url, err, n.resource_type
+                        );
+                    } else {
+                        let status = n.status.unwrap_or(0);
+                        let size = n
+                            .encoded_size
+                            .map(|s| format!("{s}B"))
+                            .unwrap_or_else(|| "?".to_string());
+                        let mime = n.mime_type.as_deref().unwrap_or("");
+                        println!(
+                            "{} {} → {} ({} {}) [{}]",
+                            n.method, n.url, status, mime, size, n.resource_type
+                        );
+                    }
                 }
             }
         }

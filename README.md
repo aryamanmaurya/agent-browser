@@ -56,6 +56,7 @@ agent-browser resize 1280 800
 agent-browser viewport mobile           # mobile | tablet | desktop
 agent-browser wait-for --kind text "Welcome" --timeout-ms 5000
 agent-browser console                   # drain console logs since last snapshot
+agent-browser network                   # drain all network requests (method, URL, status, MIME, size)
 agent-browser cookies
 agent-browser local-storage             # all keys, or: local-storage mykey
 agent-browser back
@@ -97,6 +98,80 @@ The screenshot is a base64 PNG printed inline. If the orchestrator's model is
 multimodal, pass the base64 (as a data URL) to the model so it can *see* the
 page. If the model is text-only, use `snapshot --text-only` to skip the image.
 
+The snapshot also includes a `=== NETWORK FAILURES ===` section showing any
+requests that failed since the last snapshot (network errors, 4xx/5xx that
+the browser couldn't reach, etc.). Use the `network` command for the full
+request log including successes.
+
+## Network capture
+
+The daemon captures all network requests via CDP's Network domain. Each entry
+includes: method, URL, resource type (Document/XHR/Fetch/Image/etc.), HTTP
+status, MIME type, response size, and failure info.
+
+- **`snapshot`** surfaces failed requests only (signal, not noise).
+- **`network`** drains and returns ALL requests (success + failure).
+- The buffer is capped at 1000 entries (oldest dropped on overflow).
+
+Example `network` output:
+```
+=== NETWORK (7 requests) ===
+GET http://localhost:3000/ → 200 (text/html 1.2KB) [Document]
+GET http://localhost:3000/_next/static/chunk.js → 200 (application/javascript 45KB) [Script]
+POST http://localhost:3000/api/data → 500 (application/json 0.3KB) [Fetch]
+GET http://localhost:3000/missing.png → FAILED (net::ERR_FILE_NOT_FOUND) [Image]
+```
+
+## MCP server mode
+
+The `mcp` subcommand runs agent-browser as an MCP (Model Context Protocol)
+server over stdio. An MCP client (Claude Desktop, Cursor, any MCP-compatible
+client) spawns this process and exchanges newline-delimited JSON-RPC 2.0
+messages. All 20 browser commands are exposed as MCP tools.
+
+```bash
+agent-browser mcp
+```
+
+**Key advantage:** the `snapshot` tool returns TWO content blocks — a text
+block (URL, title, console, network failures, visible text) AND an image
+block (base64 PNG). Multimodal models like Claude 3.5 Sonnet / GPT-4o can
+actually *see* the page screenshot, not just read its text.
+
+### Claude Desktop configuration
+
+Add to `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "/path/to/agent-browser",
+      "args": ["mcp"],
+      "env": {
+        "AGENT_BROWSER_CHROME": "/path/to/chrome"
+      }
+    }
+  }
+}
+```
+
+### Available MCP tools (20)
+
+`navigate`, `snapshot`, `status`, `click`, `type`, `press`, `scroll`, `hover`,
+`select`, `resize`, `viewport`, `wait_for`, `console`, `cookies`,
+`local_storage`, `network`, `back`, `forward`, `reload`, `close`
+
+Each tool's `inputSchema` is a JSON Schema object. The `snapshot` tool accepts
+an optional `text_only` boolean to skip the screenshot (for text-only models).
+
+### Protocol details
+
+- Transport: stdio, newline-delimited JSON-RPC 2.0
+- Protocol version: 2024-11-05
+- The server launches its own Chromium instance (separate from the daemon)
+- All logging goes to stderr; stdout is reserved exclusively for MCP messages
+- On stdin EOF (client disconnect), the server closes the browser and exits
+
 ## Architecture
 
 ```
@@ -111,7 +186,7 @@ page. If the model is text-only, use `snapshot --text-only` to skip the image.
 │  Daemon (long-lived, detached)               │
 │   • holds chromiumoxide Browser + Page open  │
 │   • pumps CDP handler on a background task   │
-│   • captures console events into a buffer    │
+│   • captures console + network events        │
 │   • idle timeout: 10 min                     │
 │   • serial Request → Response per connection │
 ├──────────────────────────────────────────────┤
@@ -150,19 +225,20 @@ lighter "does this look right" loop that runs during construction.
 - **`press` for named keys** dispatches CDP `Input.dispatchKeyEvent` with
   `key`+`code` set to the same value. Covers Enter/Escape/Tab; complex key
   chords (Shift+letter, Ctrl+Key) are not yet implemented.
-- **No network capture yet** (milestone 5). Failed-fetch diagnosis relies on
-  console errors for now.
-- **One page per daemon.** Tab/popup handling is not implemented.
+- **One page per daemon/MCP server.** Tab/popup handling is not implemented.
 - **`cargo build` produces a ~140 MB debug binary.** Use `--release` for a
-  smaller, faster binary.
+  smaller, faster binary (~13 MB).
+- **MCP mode runs its own browser** (separate from the CLI daemon). If you
+  run both simultaneously, they use separate Chromium processes.
 
 ## Files
 
 ```
 src/
-  main.rs        CLI parsing (clap), request building, daemon dispatch
+  main.rs        CLI parsing (clap), request building, daemon/MCP dispatch
   protocol.rs    Request/Response enums + length-prefixed frame helpers
-  daemon.rs      Persistent daemon: browser lifecycle, UDS server, console capture
+  daemon.rs      Persistent daemon: browser lifecycle, UDS server, console + network capture
+  mcp.rs         MCP server over stdio: JSON-RPC, tool schemas, multimodal snapshot
   client.rs      CLI client: connect/auto-spawn, send, print (LLM-friendly format)
   commands.rs    Command implementations against the chromiumoxide Page
   selector.rs    text=/role=/xpath=/css= selector resolution

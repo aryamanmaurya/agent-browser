@@ -8,6 +8,7 @@
 mod client;
 mod commands;
 mod daemon;
+mod mcp;
 mod protocol;
 mod selector;
 
@@ -97,6 +98,8 @@ enum Cmd {
     },
     /// Dump console logs captured since the last snapshot/console drain.
     Console,
+    /// Dump all network requests (success + failure) captured since the last drain.
+    Network,
     /// Get cookies for the current page.
     Cookies,
     /// Get localStorage entries (all, or one key).
@@ -112,6 +115,11 @@ enum Cmd {
     Reload,
     /// Close the session and stop the daemon.
     Close,
+    /// Run as an MCP (Model Context Protocol) server over stdio. Exposes all
+    /// browser commands as MCP tools for LLM clients (Claude Desktop, etc.).
+    /// The snapshot tool returns screenshots as image content blocks that
+    /// multimodal models can see.
+    Mcp,
 }
 
 fn default_socket_path() -> Result<PathBuf> {
@@ -177,6 +185,10 @@ async fn main() -> Result<()> {
             .await
         }
         cmd => {
+            if matches!(cmd, Cmd::Mcp) {
+                mcp::run(chrome).await?;
+                return Ok(());
+            }
             let req = build_request(cmd);
             let resp = client::send(req, &socket, &chrome).await?;
             client::print_response(resp);
@@ -209,12 +221,13 @@ fn build_request(cmd: Cmd) -> Request {
             timeout_ms,
         },
         Cmd::Console => Request::Console,
+        Cmd::Network => Request::Network,
         Cmd::Cookies => Request::Cookies,
         Cmd::LocalStorage { key } => Request::LocalStorage { key },
         Cmd::Back => Request::Back,
         Cmd::Forward => Request::Forward,
         Cmd::Reload => Request::Reload,
-        // Daemon is handled in main, not here.
         Cmd::Daemon { .. } => unreachable!(),
+        Cmd::Mcp => unreachable!(),
     }
 }

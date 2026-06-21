@@ -35,6 +35,7 @@ pub enum Request {
     Console,
     Cookies,
     LocalStorage { key: Option<String> },
+    Network,
     Back,
     Forward,
     Reload,
@@ -61,6 +62,9 @@ pub enum Response {
         text: String,
         /// Console entries captured since the previous snapshot/command.
         console: Vec<ConsoleEntry>,
+        /// Network requests that FAILED since the last snapshot (signal, not noise).
+        /// Full network log (including successes) is available via the `network` command.
+        network_failures: Vec<NetworkEntry>,
         viewport: (u32, u32),
         url: String,
         title: String,
@@ -68,6 +72,7 @@ pub enum Response {
     Console { entries: Vec<ConsoleEntry> },
     Cookies { cookies: Vec<Cookie> },
     LocalStorage { entries: Vec<(String, String)> },
+    Network { entries: Vec<NetworkEntry> },
     Error { message: String },
 }
 
@@ -78,6 +83,29 @@ pub struct ConsoleEntry {
     pub text: String,
     /// Where the message came from (JS line, or "network" for failed requests).
     pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkEntry {
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    /// Document, Stylesheet, Image, Script, XHR, Fetch, etc.
+    pub resource_type: String,
+    /// HTTP status code, if a response was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Response body size in bytes, if loading finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoded_size: Option<i64>,
+    /// True if the request failed (network error, blocked, canceled, etc.).
+    pub failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

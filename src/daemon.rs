@@ -4,8 +4,8 @@
 //! Unix domain socket. The CLI auto-spawns this on first use; it shuts itself
 //! down on an idle timeout or an explicit `Shutdown`/`Close` command.
 
-use crate::commands::{self, ConsoleBuffer};
-use crate::protocol::{read_frame, write_frame, ConsoleEntry, Request, Response};
+use crate::commands::{self, ConsoleBuffer, NetworkBuffer};
+use crate::protocol::{read_frame, write_frame, ConsoleEntry, NetworkEntry, Request, Response};
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::Page;
@@ -73,7 +73,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     }
 
     let console_buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
+    let network_buf: NetworkBuffer = Arc::new(Mutex::new(Vec::new()));
     spawn_console_listener(&page, console_buf.clone());
+    spawn_network_listener(&page, network_buf.clone());
 
     if let Some(url) = &opts.initial_url {
         let _ = page.goto(url).await;
@@ -116,7 +118,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             }
         };
 
-        let resp = dispatch(&req, &page, &console_buf, start).await;
+        let resp = dispatch(&req, &page, &console_buf, &network_buf, start).await;
         idle_deadline = Instant::now() + idle_timeout;
 
         let is_shutdown = matches!(req, Request::Shutdown | Request::Close);
@@ -141,6 +143,7 @@ async fn dispatch(
     req: &Request,
     page: &Page,
     console: &ConsoleBuffer,
+    network: &NetworkBuffer,
     start: Instant,
 ) -> Response {
     match req {
@@ -156,7 +159,7 @@ async fn dispatch(
         }
         Request::Shutdown | Request::Close => Response::ok("shutting down"),
         Request::Navigate { url } => commands::navigate(page, url).await,
-        Request::Snapshot { text_only } => commands::snapshot(page, console, *text_only).await,
+        Request::Snapshot { text_only } => commands::snapshot(page, console, network, *text_only).await,
         Request::Click { selector } => commands::click(page, selector).await,
         Request::Hover { selector } => commands::hover(page, selector).await,
         Request::Type { selector, text } => commands::type_text(page, selector, text).await,
@@ -173,16 +176,122 @@ async fn dispatch(
         Request::Console => commands::console(console).await,
         Request::Cookies => commands::cookies(page).await,
         Request::LocalStorage { key } => commands::local_storage(page, key.as_deref()).await,
+        Request::Network => commands::network(network).await,
         Request::Back => commands::back(page).await,
         Request::Forward => commands::forward(page).await,
         Request::Reload => commands::reload(page).await,
     }
 }
 
+/// Best-effort network capture. Subscribes to CDP Network domain events
+/// (requestWillBeSent, responseReceived, loadingFinished, loadingFailed) and
+/// maintains a per-request entry in the shared buffer. The Network domain
+/// must be enabled first via `Network.enable`.
+pub fn spawn_network_listener(page: &Page, buf: NetworkBuffer) {
+    use chromiumoxide::cdp::browser_protocol::network::EnableParams;
+
+    // Enable the Network domain so events start flowing.
+    let page_for_enable = page.clone();
+    tokio::spawn(async move {
+        if let Err(e) = page_for_enable.execute(EnableParams::default()).await {
+            tracing::warn!("failed to enable Network domain: {e}");
+        }
+    });
+
+    let page_clone = page.clone();
+    tokio::spawn(async move {
+        use chromiumoxide::cdp::browser_protocol::network::{
+            EventRequestWillBeSent, EventResponseReceived, EventLoadingFinished,
+            EventLoadingFailed,
+        };
+
+        // requestWillBeSent → create new entry
+        if let Ok(mut events) = page_clone.event_listener::<EventRequestWillBeSent>().await {
+            let buf1 = buf.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = events.next().await {
+                    let entry = NetworkEntry {
+                        request_id: ev.request_id.inner().clone(),
+                        method: ev.request.method.clone(),
+                        url: ev.request.url.clone(),
+                        resource_type: ev
+                            .r#type
+                            .as_ref()
+                            .map(|t| format!("{:?}", t))
+                            .unwrap_or_else(|| "Unknown".to_string()),
+                        status: None,
+                        status_text: None,
+                        mime_type: None,
+                        encoded_size: None,
+                        failed: false,
+                        error_text: None,
+                    };
+                    commands::push_network_entry(&buf1, entry);
+                }
+            });
+        } else {
+            tracing::warn!("failed to subscribe to EventRequestWillBeSent");
+        }
+
+        // responseReceived → update status/mime
+        if let Ok(mut events) = page_clone.event_listener::<EventResponseReceived>().await {
+            let buf2 = buf.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = events.next().await {
+                    let rid = ev.request_id.inner().clone();
+                    let status = ev.response.status as i32;
+                    let status_text = ev.response.status_text.clone();
+                    let mime = ev.response.mime_type.clone();
+                    commands::update_network_entry(&buf2, &rid, |e| {
+                        e.status = Some(status);
+                        e.status_text = Some(status_text);
+                        e.mime_type = Some(mime);
+                    });
+                }
+            });
+        } else {
+            tracing::warn!("failed to subscribe to EventResponseReceived");
+        }
+
+        // loadingFinished → record size
+        if let Ok(mut events) = page_clone.event_listener::<EventLoadingFinished>().await {
+            let buf3 = buf.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = events.next().await {
+                    let rid = ev.request_id.inner().clone();
+                    let size = ev.encoded_data_length as i64;
+                    commands::update_network_entry(&buf3, &rid, |e| {
+                        e.encoded_size = Some(size);
+                    });
+                }
+            });
+        } else {
+            tracing::warn!("failed to subscribe to EventLoadingFinished");
+        }
+
+        // loadingFailed → mark as failed + error text
+        if let Ok(mut events) = page_clone.event_listener::<EventLoadingFailed>().await {
+            let buf4 = buf.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = events.next().await {
+                    let rid = ev.request_id.inner().clone();
+                    let err = ev.error_text.clone();
+                    commands::update_network_entry(&buf4, &rid, |e| {
+                        e.failed = true;
+                        e.error_text = Some(err);
+                    });
+                }
+            });
+        } else {
+            tracing::warn!("failed to subscribe to EventLoadingFailed");
+        }
+    });
+}
+
 /// Best-effort console capture. Subscribes to CDP `Runtime.consoleAPICalled`
 /// and `Runtime.exceptionThrown` events and pushes entries into the shared
 /// buffer. If subscription fails the daemon still works, just without console.
-fn spawn_console_listener(page: &Page, buf: ConsoleBuffer) {
+pub fn spawn_console_listener(page: &Page, buf: ConsoleBuffer) {
     let page_clone = page.clone();
     tokio::spawn(async move {
         use chromiumoxide::cdp::js_protocol::runtime::{

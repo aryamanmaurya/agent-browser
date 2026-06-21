@@ -3,7 +3,7 @@
 //! Each public function takes the live `Page` (and console buffer where
 //! relevant) and returns a `Response`. The daemon dispatches to these.
 
-use crate::protocol::{ConsoleEntry, Cookie, Response};
+use crate::protocol::{ConsoleEntry, Cookie, NetworkEntry, Response};
 use crate::selector::{js_quote, resolve, Resolved};
 use anyhow::Result;
 use base64::Engine;
@@ -15,6 +15,13 @@ use std::time::{Duration, Instant};
 
 /// Shared console log buffer, drained on snapshot/console commands.
 pub type ConsoleBuffer = Arc<Mutex<Vec<ConsoleEntry>>>;
+
+/// Shared network request buffer. Stores all requests (success + failure).
+/// Drained on the `network` command; peeked (not drained) for snapshot failures.
+pub type NetworkBuffer = Arc<Mutex<Vec<NetworkEntry>>>;
+
+/// Cap the network buffer to prevent unbounded growth on heavy pages.
+const NETWORK_BUFFER_CAP: usize = 1000;
 
 pub async fn navigate(page: &Page, url: &str) -> Response {
     match page.goto(url).await {
@@ -28,12 +35,23 @@ pub async fn navigate(page: &Page, url: &str) -> Response {
     }
 }
 
-pub async fn snapshot(page: &Page, console: &ConsoleBuffer, text_only: bool) -> Response {
+pub async fn snapshot(
+    page: &Page,
+    console: &ConsoleBuffer,
+    network: &NetworkBuffer,
+    text_only: bool,
+) -> Response {
     let url = page_url(page).await.unwrap_or_default();
     let title = page_title(page).await.unwrap_or_default();
     let text = page_text(page).await.unwrap_or_default();
     let viewport = page_viewport(page).await.unwrap_or((1280, 800));
     let console_entries = drain_console(console);
+    // Peek (clone without clearing) failed requests for the snapshot.
+    // Full network log is drained by the `network` command.
+    let network_failures = {
+        let buf = network.lock().unwrap();
+        buf.iter().filter(|e| e.failed).cloned().collect()
+    };
 
     let screenshot_b64 = if text_only {
         None
@@ -58,6 +76,7 @@ pub async fn snapshot(page: &Page, console: &ConsoleBuffer, text_only: bool) -> 
         screenshot_b64,
         text,
         console: console_entries,
+        network_failures,
         viewport,
         url,
         title,
@@ -277,6 +296,16 @@ pub async fn console(console: &ConsoleBuffer) -> Response {
     Response::Console { entries: drain_console(console) }
 }
 
+pub async fn network(network: &NetworkBuffer) -> Response {
+    let entries = {
+        let mut buf = network.lock().unwrap();
+        let drained = buf.clone();
+        buf.clear();
+        drained
+    };
+    Response::Network { entries }
+}
+
 pub async fn cookies(page: &Page) -> Response {
     match page.get_cookies().await {
         Ok(cookies) => {
@@ -398,6 +427,29 @@ fn drain_console(console: &ConsoleBuffer) -> Vec<ConsoleEntry> {
     let drained = buf.clone();
     buf.clear();
     drained
+}
+
+/// Push a network entry into the buffer, capping at NETWORK_BUFFER_CAP (drop oldest).
+pub fn push_network_entry(network: &NetworkBuffer, entry: NetworkEntry) {
+    let mut buf = network.lock().unwrap();
+    if buf.len() >= NETWORK_BUFFER_CAP {
+        buf.remove(0);
+    }
+    buf.push(entry);
+}
+
+/// Update an existing network entry by request_id (for response/finish/fail events).
+pub fn update_network_entry<F>(network: &NetworkBuffer, request_id: &str, update: F)
+where
+    F: FnOnce(&mut NetworkEntry),
+{
+    let mut buf = network.lock().unwrap();
+    for entry in buf.iter_mut() {
+        if entry.request_id == request_id {
+            update(entry);
+            return;
+        }
+    }
 }
 
 async fn run_js(page: &Page, script: &str, label: &str) -> Response {
