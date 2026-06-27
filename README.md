@@ -1,4 +1,4 @@
-# agent-browser
+# agent-browser (developer documentation)
 
 A persistent headless browser session for AI agents — a Rust equivalent of the
 "Agent Browser" tool, built on `chromiumoxide` (Chrome DevTools Protocol).
