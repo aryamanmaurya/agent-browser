@@ -36,6 +36,42 @@ A Chromium binary is required at runtime. Set it via `--chrome` or the
 export AGENT_BROWSER_CHROME=/path/to/chrome
 ```
 
+## Sessions (multi-agent concurrency)
+
+Each `--session <name>` gets its own independent daemon + browser + socket.
+Multiple agents can run concurrently without interfering — each has its own
+URL, its own console/network buffers, and its own headless/headful mode.
+
+```bash
+# Agent 1 — headless, testing site A
+agent-browser --session agent1 navigate http://site-a.com
+agent-browser --session agent1 snapshot
+
+# Agent 2 — headful (visible window), testing site B (runs concurrently)
+agent-browser --session agent2 --headful navigate http://site-b.com
+agent-browser --session agent2 --headful snapshot
+
+# Agent 3 — default session (no --session = "default")
+agent-browser navigate http://site-c.com
+```
+
+- **`--session <name>`**: picks which daemon to talk to (default: `"default"`)
+- **`AGENT_BROWSER_SESSION`** env var: set once, skip repeating `--session`
+- **`--headful`** / **`--visible`**: launch the browser with a visible window (only affects newly-spawned daemons)
+- **`sessions`**: list all active sessions with their mode, URL, and uptime
+- **`--session all stop`**: stop every running session
+
+```bash
+agent-browser sessions                      # list all sessions
+agent-browser --session agent1 stop         # stop one session
+agent-browser --session all stop            # stop everything
+```
+
+Session names must be filesystem-safe: `[a-zA-Z0-9_-]`, max 64 chars.
+
+Each session = one Chromium process (~100-300MB RAM). Sessions auto-shutdown
+after 10 min idle. Use `sessions` to see what's running.
+
 ## Usage
 
 Every command is a separate process invocation that connects to the daemon.
@@ -221,6 +257,12 @@ messages. All 25 browser commands are exposed as MCP tools.
 agent-browser mcp
 ```
 
+**Headful MCP mode** (visible browser window):
+
+```bash
+agent-browser mcp --headful
+```
+
 **Key advantage:** the `snapshot` tool returns TWO content blocks — a text
 block (URL, title, console, network failures, visible text) AND an image
 block (base64 PNG). Multimodal models like Claude 3.5 Sonnet / GPT-4o can
@@ -235,6 +277,21 @@ Add to `claude_desktop_config.json`:
     "agent-browser": {
       "command": "/path/to/agent-browser",
       "args": ["mcp"],
+      "env": {
+        "AGENT_BROWSER_CHROME": "/path/to/chrome"
+      }
+    }
+  }
+}
+```
+
+For headful mode (visible browser window), add `--headful` to args:
+```json
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "/path/to/agent-browser",
+      "args": ["mcp", "--headful"],
       "env": {
         "AGENT_BROWSER_CHROME": "/path/to/chrome"
       }

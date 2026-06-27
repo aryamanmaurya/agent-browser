@@ -8,26 +8,28 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 
 /// Send a request to the daemon. Auto-spawns the daemon if the socket is not
-/// accepting connections.
+/// accepting connections. `headful` only affects newly-spawned daemons; if a
+/// daemon is already running on this socket, the flag is ignored.
 pub async fn send(
     req: Request,
     socket_path: &Path,
     chrome_executable: &Path,
+    headful: bool,
 ) -> Result<Response> {
-    let stream = connect_or_spawn(socket_path, chrome_executable).await?;
+    let stream = connect_or_spawn(socket_path, chrome_executable, headful).await?;
     let mut stream = stream;
     write_frame(&mut stream, &req).await?;
     let resp: Response = read_frame(&mut stream).await?;
     Ok(resp)
 }
 
-async fn connect_or_spawn(socket_path: &Path, chrome_executable: &Path) -> Result<UnixStream> {
+async fn connect_or_spawn(socket_path: &Path, chrome_executable: &Path, headful: bool) -> Result<UnixStream> {
     // Fast path: daemon already running.
     if let Ok(s) = UnixStream::connect(socket_path).await {
         return Ok(s);
     }
     // Spawn the daemon detached.
-    spawn_daemon_detached(socket_path, chrome_executable)?;
+    spawn_daemon_detached(socket_path, chrome_executable, headful)?;
     // Wait for it to accept connections.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -45,7 +47,7 @@ async fn connect_or_spawn(socket_path: &Path, chrome_executable: &Path) -> Resul
     }
 }
 
-fn spawn_daemon_detached(socket_path: &Path, chrome_executable: &Path) -> Result<()> {
+fn spawn_daemon_detached(socket_path: &Path, chrome_executable: &Path, headful: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = socket_path.with_extension("daemon.log");
     if let Some(parent) = log_path.parent() {
@@ -62,8 +64,11 @@ fn spawn_daemon_detached(socket_path: &Path, chrome_executable: &Path) -> Result
         .arg("--chrome")
         .arg(chrome_executable)
         .arg("--socket")
-        .arg(socket_path)
-        .stdin(std::process::Stdio::null())
+        .arg(socket_path);
+    if headful {
+        cmd.arg("--headful");
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(stderr));
 
@@ -96,10 +101,12 @@ pub fn print_response(resp: Response) {
             viewport,
             chrome_pid,
             uptime_secs,
+            headful,
         } => {
             println!("=== AGENT-BROWSER STATUS ===");
             println!("URL: {url}");
             println!("Viewport: {} x {}", viewport.0, viewport.1);
+            println!("Mode: {}", if headful { "headful" } else { "headless" });
             println!("Daemon PID: {chrome_pid}");
             println!("Uptime: {uptime_secs}s");
         }
@@ -289,4 +296,115 @@ fn trim_text(s: &str, max: usize) -> String {
     let mut out = s[..s.char_indices().take(max).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(max)].to_string();
     out.push_str("\n... [truncated]");
     out
+}
+
+// ==================== Session management ====================
+
+/// Validate a session name. Must be filesystem-safe: [a-zA-Z0-9_-], max 64 chars.
+pub fn validate_session_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("session name cannot be empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("session name too long (max 64 chars): {name}");
+    }
+    if name == "all" {
+        // "all" is reserved for `--session all stop`
+        return Ok(());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        anyhow::bail!(
+            "invalid session name {:?} (allowed: a-z, A-Z, 0-9, _, -, max 64 chars)",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Compute the socket path for a given session name.
+pub fn session_socket_path(session: &str) -> Result<std::path::PathBuf> {
+    validate_session_name(session)?;
+    let base = dirs::cache_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| anyhow!("cannot determine cache/data directory for socket"))?;
+    Ok(base.join("agent-browser").join(format!("{session}.sock")))
+}
+
+/// One session's info, as returned by `list_sessions`.
+pub struct SessionInfo {
+    pub name: String,
+    pub url: String,
+    pub headful: bool,
+    pub uptime_secs: u64,
+}
+
+/// List all running sessions by scanning the socket directory and probing each.
+pub async fn list_sessions() -> Result<Vec<SessionInfo>> {
+    let base = dirs::cache_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| anyhow!("cannot determine cache/data directory"))?;
+    let dir = base.join("agent-browser");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Look for *.sock files (not *.log files).
+        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Try to connect and get status.
+        match UnixStream::connect(&path).await {
+            Ok(mut stream) => {
+                if write_frame(&mut stream, &Request::Status).await.is_ok() {
+                    if let Ok(resp) = read_frame::<_, Response>(&mut stream).await {
+                        if let Response::Status { url, headful, uptime_secs, .. } = resp {
+                            sessions.push(SessionInfo {
+                                name,
+                                url,
+                                headful,
+                                uptime_secs,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Socket exists but no daemon accepting — skip (or stale).
+            }
+        }
+    }
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
+}
+
+/// Print the session list in a table format.
+pub fn print_sessions(sessions: &[SessionInfo]) {
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return;
+    }
+    println!("{:<16} {:<10} {:<40} {:<10}", "SESSION", "MODE", "URL", "UPTIME");
+    println!("{}", "-".repeat(80));
+    for s in sessions {
+        let mode = if s.headful { "headful" } else { "headless" };
+        let url_display = if s.url.len() > 38 {
+            format!("{}...", &s.url[..35])
+        } else {
+            s.url.clone()
+        };
+        let uptime = format!("{}m {}s", s.uptime_secs / 60, s.uptime_secs % 60);
+        println!("{:<16} {:<10} {:<40} {:<10}", s.name, mode, url_display, uptime);
+    }
+    println!("\n{} session(s) active.", sessions.len());
 }

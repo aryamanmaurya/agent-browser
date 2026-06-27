@@ -22,17 +22,25 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Entry point for `agent-browser mcp`. Launches the browser, then serves
-/// MCP requests over stdio until stdin closes.
-pub async fn run(chrome_executable: PathBuf) -> Result<()> {
-    tracing::info!("MCP server starting; chrome={:?}", chrome_executable);
+/// MCP requests over stdio until stdin closes. `headful` controls whether
+/// the browser window is visible.
+pub async fn run(chrome_executable: PathBuf, headful: bool) -> Result<()> {
+    tracing::info!("MCP server starting; chrome={:?} headful={}", chrome_executable, headful);
 
     // Launch browser (same setup as the daemon).
-    let config = BrowserConfig::builder()
+    // MCP mode uses its own user-data-dir to avoid SingletonLock conflicts
+    // with any CLI daemons that might be running.
+    let user_data_dir = std::env::temp_dir().join("agent-browser-mcp-profile");
+    std::fs::create_dir_all(&user_data_dir).ok();
+    let mut cfg = BrowserConfig::builder()
         .chrome_executable(chrome_executable)
-        .arg("--headless=new")
+        .user_data_dir(&user_data_dir)
         .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
+        .arg("--disable-dev-shm-usage");
+    if !headful {
+        cfg = cfg.arg("--headless=new").arg("--disable-gpu");
+    }
+    let config = cfg
         .window_size(1280, 800)
         .build()
         .map_err(|e| anyhow!("browser config failed: {e}"))?;
@@ -70,6 +78,7 @@ pub async fn run(chrome_executable: PathBuf) -> Result<()> {
         page,
         console: console_buf,
         network: network_buf,
+        headful,
     };
 
     // Serve stdio.
@@ -116,6 +125,7 @@ struct McpState {
     page: Page,
     console: ConsoleBuffer,
     network: NetworkBuffer,
+    headful: bool,
 }
 
 // ---------- JSON-RPC types ----------
@@ -361,6 +371,7 @@ async fn handle_tools_call(params: &Value, state: &McpState) -> Result<Value, Js
                 viewport,
                 chrome_pid: std::process::id(),
                 uptime_secs: 0,
+                headful: state.headful,
             }
         }
         "click" => {
@@ -503,6 +514,7 @@ fn response_to_mcp_content(resp: &Response) -> (Vec<Value>, bool) {
             viewport,
             chrome_pid,
             uptime_secs,
+            headful: _,
         } => (
             vec![json!({"type": "text", "text": format!(
                 "URL: {url}\nViewport: {} x {}\nPID: {chrome_pid}\nUptime: {uptime_secs}s",

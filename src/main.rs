@@ -28,9 +28,19 @@ struct Cli {
     #[arg(long, global = true, env = "AGENT_BROWSER_CHROME")]
     chrome: Option<PathBuf>,
 
-    /// Path to the daemon's Unix socket.
+    /// Path to the daemon's Unix socket (overrides --session).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+
+    /// Session name. Each session is an independent daemon + browser.
+    /// Use different names for concurrent agents. Defaults to "default".
+    #[arg(long, global = true, env = "AGENT_BROWSER_SESSION", default_value = "default")]
+    session: String,
+
+    /// Launch the browser in headful mode (visible window). Only affects
+    /// newly-spawned daemons; if a daemon is already running, this is ignored.
+    #[arg(long, global = true, aliases = ["visible"])]
+    headful: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -46,6 +56,9 @@ enum Cmd {
         /// Idle shutdown timeout in seconds.
         #[arg(long, default_value_t = 600)]
         idle_timeout_secs: u64,
+        /// Launch in headful mode (visible window).
+        #[arg(long, aliases = ["visible"])]
+        headful: bool,
     },
     /// Show daemon status (URL, viewport, uptime).
     Status,
@@ -124,6 +137,8 @@ enum Cmd {
     Reload,
     /// Close the session and stop the daemon.
     Close,
+    /// List all active sessions (name, mode, URL, uptime).
+    Sessions,
     // --- new feature commands ---
     /// Throttle network conditions. Presets: offline, slow-3g, fast-3g, none.
     Throttle {
@@ -155,13 +170,6 @@ enum Cmd {
     /// The snapshot tool returns screenshots as image content blocks that
     /// multimodal models can see.
     Mcp,
-}
-
-fn default_socket_path() -> Result<PathBuf> {
-    let base = dirs::cache_dir()
-        .or_else(dirs::data_dir)
-        .ok_or_else(|| anyhow!("cannot determine cache/data directory for socket"))?;
-    Ok(base.join("agent-browser").join("sock"))
 }
 
 fn resolve_chrome(cli_chrome: Option<PathBuf>) -> Result<PathBuf> {
@@ -200,32 +208,57 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let chrome = resolve_chrome(cli.chrome.clone())?;
+
+    // Resolve socket path: explicit --socket wins, else per-session path.
     let socket = match cli.socket.clone() {
         Some(s) => s,
-        None => default_socket_path()?,
+        None => client::session_socket_path(&cli.session)?,
     };
-    let chrome = resolve_chrome(cli.chrome.clone())?;
 
     match cli.cmd {
         Cmd::Daemon {
             initial_url,
             idle_timeout_secs,
+            headful: daemon_headful,
         } => {
             daemon::run(daemon::DaemonOptions {
                 chrome_executable: chrome,
                 socket_path: socket,
                 initial_url,
                 idle_timeout_secs,
+                headful: daemon_headful,
             })
             .await
         }
+        Cmd::Sessions => {
+            let sessions = client::list_sessions().await?;
+            client::print_sessions(&sessions);
+            Ok(())
+        }
         cmd => {
             if matches!(cmd, Cmd::Mcp) {
-                mcp::run(chrome).await?;
+                mcp::run(chrome, cli.headful).await?;
+                return Ok(());
+            }
+            // Handle "--session all stop" — stop every running session.
+            if matches!(cmd, Cmd::Stop | Cmd::Close) && cli.session == "all" {
+                let sessions = client::list_sessions().await?;
+                if sessions.is_empty() {
+                    println!("No active sessions to stop.");
+                    return Ok(());
+                }
+                for s in &sessions {
+                    let p = client::session_socket_path(&s.name)?;
+                    match client::send(Request::Shutdown, &p, &chrome, false).await {
+                        Ok(_) => println!("stopped session: {}", s.name),
+                        Err(e) => eprintln!("failed to stop {}: {e}", s.name),
+                    }
+                }
                 return Ok(());
             }
             let req = build_request(cmd);
-            let resp = client::send(req, &socket, &chrome).await?;
+            let resp = client::send(req, &socket, &chrome, cli.headful).await?;
             client::print_response(resp);
             Ok(())
         }
@@ -264,6 +297,7 @@ fn build_request(cmd: Cmd) -> Request {
         Cmd::Reload => Request::Reload,
         Cmd::Daemon { .. } => unreachable!(),
         Cmd::Mcp => unreachable!(),
+        Cmd::Sessions => unreachable!(),
         // New feature commands:
         Cmd::Throttle { preset } => Request::Throttle { preset },
         Cmd::Pdf { path } => Request::Pdf { path },

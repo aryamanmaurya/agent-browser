@@ -22,6 +22,7 @@ pub struct DaemonOptions {
     pub socket_path: PathBuf,
     pub initial_url: Option<String>,
     pub idle_timeout_secs: u64,
+    pub headful: bool,
 }
 
 pub async fn run(opts: DaemonOptions) -> Result<()> {
@@ -38,13 +39,30 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     std::fs::remove_file(&opts.socket_path).ok();
 
     // Launch the browser.
-    let browser_cfg = BrowserConfig::builder()
+    // Each session gets its own user-data-dir to avoid Chromium's SingletonLock
+    // (which prevents multiple instances from sharing a profile directory).
+    let user_data_dir = opts
+        .socket_path
+        .with_file_name(format!(
+            "{}-profile",
+            opts.socket_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default")
+        ));
+    std::fs::create_dir_all(&user_data_dir).ok();
+    let mut browser_cfg = BrowserConfig::builder()
         .chrome_executable(opts.chrome_executable.clone())
-        .arg("--headless=new")
+        .user_data_dir(&user_data_dir)
         .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
-        .window_size(1280, 800);
+        .arg("--disable-dev-shm-usage");
+    // Headless is the default; only skip it when --headful was requested.
+    if !opts.headful {
+        browser_cfg = browser_cfg
+            .arg("--headless=new")
+            .arg("--disable-gpu");
+    }
+    browser_cfg = browser_cfg.window_size(1280, 800);
     let config = browser_cfg
         .build()
         .map_err(|e| anyhow!("browser config failed: {e}"))?;
@@ -125,7 +143,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             }
         };
 
-        let resp = dispatch(&req, &tabs, &active_tab, &console_buf, &network_buf, &browser, start).await;
+        let resp = dispatch(&req, &tabs, &active_tab, &console_buf, &network_buf, &browser, start, opts.headful).await;
         idle_deadline = Instant::now() + idle_timeout;
 
         let is_shutdown = matches!(req, Request::Shutdown | Request::Close);
@@ -154,6 +172,7 @@ async fn dispatch(
     network: &NetworkBuffer,
     browser: &Browser,
     start: Instant,
+    headful: bool,
 ) -> Response {
     // Handle tab management requests first (they don't need an active page).
     match req {
@@ -243,6 +262,7 @@ async fn dispatch(
                 viewport,
                 chrome_pid: std::process::id(),
                 uptime_secs: start.elapsed().as_secs(),
+                headful: headful,
             }
         }
         Request::Shutdown | Request::Close => Response::ok("shutting down"),

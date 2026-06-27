@@ -68,6 +68,7 @@ pub enum Response {
         viewport: (u32, u32),
         chrome_pid: u32,
         uptime_secs: u64,
+        headful: bool,
     },
     Snapshot {
         /// Base64-encoded PNG screenshot. Absent when `text_only` was requested
