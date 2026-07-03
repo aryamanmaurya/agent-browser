@@ -37,7 +37,9 @@ pub async fn run(chrome_executable: PathBuf, headful: bool) -> Result<()> {
         .user_data_dir(&user_data_dir)
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage");
-    if !headful {
+    if headful {
+        cfg = cfg.with_head();
+    } else {
         cfg = cfg.arg("--headless=new").arg("--disable-gpu");
     }
     let config = cfg

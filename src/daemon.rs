@@ -57,7 +57,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage");
     // Headless is the default; only skip it when --headful was requested.
-    if !opts.headful {
+    if opts.headful {
+        browser_cfg = browser_cfg.with_head();
+    } else {
         browser_cfg = browser_cfg
             .arg("--headless=new")
             .arg("--disable-gpu");
@@ -157,10 +159,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         }
     }
 
-    tracing::info!("daemon closing browser and removing socket");
+    // Remove socket immediately so new clients don't connect to a dying daemon.
+    std::fs::remove_file(&opts.socket_path).ok();
+    tracing::info!("daemon closing browser");
     let _ = browser.close().await;
     let _ = browser.wait().await;
-    std::fs::remove_file(&opts.socket_path).ok();
     Ok(())
 }
 
