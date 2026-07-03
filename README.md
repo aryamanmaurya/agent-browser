@@ -1,5 +1,7 @@
 # agent-browser (developer documentation)
 
+# A browser for ai agents to be added as their skills. allows ai agents, to launch headful, headless, capture network requestis and many more cool capabilities.
+
 A persistent headless browser session for AI agents — a Rust equivalent of the
 "Agent Browser" tool, built on `chromiumoxide` (Chrome DevTools Protocol).
 
