@@ -35,7 +35,7 @@ A Chromium binary is required at runtime. Set it via `--chrome` or the
 `AGENT_BROWSER_CHROME` environment variable:
 
 ```bash
-export AGENT_BROWSER_CHROME=/path/to/chrome
+export AGENT_BROWSER_CHROME=/path/to/chromium
 ```
 
 ## Sessions (multi-agent concurrency)
