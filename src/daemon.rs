@@ -4,7 +4,7 @@
 //! Unix domain socket. The CLI auto-spawns this on first use; it shuts itself
 //! down on an idle timeout or an explicit `Shutdown`/`Close` command.
 
-use crate::commands::{self, ConsoleBuffer, NetworkBuffer};
+use crate::commands::{self, ConsoleBuffer, InteractionBuffer, NetworkBuffer};
 use crate::protocol::{read_frame, write_frame, ConsoleEntry, NetworkEntry, Request, Response, TabInfo};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -23,6 +23,80 @@ pub struct DaemonOptions {
     pub initial_url: Option<String>,
     pub idle_timeout_secs: u64,
     pub headful: bool,
+}
+
+/// The injected interaction recorder. Must be idempotent, never throw, and
+/// produce no visual/log noise beyond the marker console.debug call. Forwards
+/// every curated input event to the daemon as a `console.debug(MARKER, JSON)`.
+const RECORDER_SCRIPT: &str = r##"(function () {
+  if (window.__agentBrowserRecorder) return;
+  window.__agentBrowserRecorder = true;
+  var MARKER = "[agent-browser:interaction]";
+
+  function selector(el) {
+    if (!el || el.nodeType !== 1) return "";
+    var a = el.getAttribute;
+    if (el.id) return "#" + el.id;
+    if (a && a.call(el, "data-testid")) return '[data-testid="' + a.call(el, "data-testid") + '"]';
+    if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+    if (a && a.call(el, "aria-label")) return '[aria-label="' + a.call(el, "aria-label") + '"]';
+    var anc = el.closest ? el.closest("[id]") : null;
+    if (anc && anc !== el) return "#" + anc.id + " " + el.tagName.toLowerCase();
+    return el.tagName.toLowerCase();
+  }
+
+  function emit(type, e) {
+    try {
+      var t = e && e.target ? e.target : null;
+      var entry = {
+        type: type,
+        ts: Date.now(),
+        url: location.href,
+        path: location.pathname,
+        target: selector(t),
+        tag: t ? t.tagName.toLowerCase() : "",
+        text: t && t.textContent ? t.textContent.trim().replace(/\s+/g, " ").slice(0, 80) : "",
+        value: t && t.value !== undefined ? String(t.value).slice(0, 200) : "",
+        key: (type === "keydown" && e.key) ? String(e.key).slice(0, 20) : null,
+        x: typeof e.clientX === "number" ? Math.round(e.clientX) : null,
+        y: typeof e.clientY === "number" ? Math.round(e.clientY) : null
+      };
+      console.debug(MARKER, JSON.stringify(entry));
+    } catch (_) {}
+  }
+
+  document.addEventListener("click",  function (e) { emit("click",  e); }, true);
+  document.addEventListener("keydown", function (e) { emit("keydown", e); }, true);
+  document.addEventListener("input",   function (e) { emit("input",   e); }, true);
+  document.addEventListener("change",  function (e) { emit("change",  e); }, true);
+  document.addEventListener("submit",  function (e) { emit("submit",  e); }, true);
+})();"##;
+
+/// Inject the interaction recorder into a page.
+///
+/// - `Page.addScriptToEvaluateOnNewDocument` registers the script so it runs in
+///   every new frame document (MPA navigations, iframes, new tabs).
+/// - `run_immediately: true` also runs it on the already-loaded document.
+/// - A direct `page.evaluate` is done as a belt-and-suspenders fallback for
+///   browser versions that ignore `runImmediately`.
+///
+/// The script is idempotent (`window.__agentBrowserRecorder` guard), so the
+/// redundant injections are harmless.
+pub fn inject_interaction_recorder(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+
+    let script = RECORDER_SCRIPT.to_string();
+    let page_clone = page.clone();
+    tokio::spawn(async move {
+        if let Ok(params) = AddScriptToEvaluateOnNewDocumentParams::builder()
+            .source(script.clone())
+            .run_immediately(true)
+            .build()
+        {
+            let _ = page_clone.execute(params).await;
+        }
+        let _ = page_clone.evaluate(script.as_str()).await;
+    });
 }
 
 pub async fn run(opts: DaemonOptions) -> Result<()> {
@@ -96,8 +170,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     let console_buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
     let network_buf: NetworkBuffer = Arc::new(Mutex::new(Vec::new()));
+    let interactions_buf: InteractionBuffer = Arc::new(Mutex::new(Vec::new()));
     spawn_console_listener(&initial_page, console_buf.clone());
     spawn_network_listener(&initial_page, network_buf.clone());
+    spawn_interaction_listener(&initial_page, interactions_buf.clone());
+    inject_interaction_recorder(&initial_page);
 
     // Multi-tab manager: maps tab_id → Page, tracks the active tab.
     let tabs: Arc<Mutex<HashMap<String, Page>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -145,7 +222,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             }
         };
 
-        let resp = dispatch(&req, &tabs, &active_tab, &console_buf, &network_buf, &browser, start, opts.headful).await;
+        let resp = dispatch(&req, &tabs, &active_tab, &console_buf, &network_buf, &interactions_buf, &browser, start, opts.headful).await;
         idle_deadline = Instant::now() + idle_timeout;
 
         let is_shutdown = matches!(req, Request::Shutdown | Request::Close);
@@ -173,6 +250,7 @@ async fn dispatch(
     active_tab: &Arc<Mutex<String>>,
     console: &ConsoleBuffer,
     network: &NetworkBuffer,
+    interactions: &InteractionBuffer,
     browser: &Browser,
     start: Instant,
     headful: bool,
@@ -209,6 +287,8 @@ async fn dispatch(
                     // Attach listeners to the new tab (shared buffers).
                     spawn_console_listener(&page, console.clone());
                     spawn_network_listener(&page, network.clone());
+                    spawn_interaction_listener(&page, interactions.clone());
+                    inject_interaction_recorder(&page);
                     if let Some(u) = url {
                         let _ = page.goto(u).await;
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -288,6 +368,7 @@ async fn dispatch(
         Request::Cookies => commands::cookies(&page).await,
         Request::LocalStorage { key } => commands::local_storage(&page, key.as_deref()).await,
         Request::Network { filter } => commands::network(network, filter.as_deref()).await,
+        Request::Interactions { filter } => commands::interactions(interactions, filter.as_deref()).await,
         Request::Back => commands::back(&page).await,
         Request::Forward => commands::forward(&page).await,
         Request::Reload => commands::reload(&page).await,
@@ -460,6 +541,11 @@ pub fn spawn_console_listener(page: &Page, buf: ConsoleBuffer) {
             let buf1 = buf.clone();
             tokio::spawn(async move {
                 while let Some(ev) = events.next().await {
+                    // Skip interaction-marker events — they are routed to the
+                    // interaction buffer instead, keeping the console clean.
+                    if commands::is_interaction_marker(&ev.args) {
+                        continue;
+                    }
                     let level = format!("{:?}", ev.r#type).to_lowercase();
                     let text = ev
                         .args
@@ -502,6 +588,27 @@ pub fn spawn_console_listener(page: &Page, buf: ConsoleBuffer) {
             });
         } else {
             tracing::warn!("failed to subscribe to EventExceptionThrown");
+        }
+    });
+}
+
+/// Interaction capture. Subscribes to `Runtime.consoleAPICalled` (the recorder
+/// forwards events through it) and pushes parsed `InteractionEntry`s into the
+/// shared buffer. A separate subscription from the console listener — this one
+/// only looks at events whose first argument is the interaction marker.
+pub fn spawn_interaction_listener(page: &Page, buf: InteractionBuffer) {
+    let page_clone = page.clone();
+    tokio::spawn(async move {
+        use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+
+        if let Ok(mut events) = page_clone.event_listener::<EventConsoleApiCalled>().await {
+            while let Some(ev) = events.next().await {
+                if let Some(entry) = commands::parse_interaction_console(&ev.args) {
+                    commands::push_interaction_entry(&buf, entry);
+                }
+            }
+        } else {
+            tracing::warn!("failed to subscribe to interaction events");
         }
     });
 }

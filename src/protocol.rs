@@ -36,6 +36,9 @@ pub enum Request {
     Cookies,
     LocalStorage { key: Option<String> },
     Network { filter: Option<String> },
+    /// Drain the interaction buffer (clicks, typing, form submits) since the
+    /// last drain. Entries are shared across all tabs.
+    Interactions { filter: Option<String> },
     Back,
     Forward,
     Reload,
@@ -90,6 +93,7 @@ pub enum Response {
     Cookies { cookies: Vec<Cookie> },
     LocalStorage { entries: Vec<(String, String)> },
     Network { entries: Vec<NetworkEntry> },
+    Interactions { entries: Vec<InteractionEntry> },
     Pdf { path: String, size_bytes: usize },
     Inspect { info: ElementInfo },
     Accessibility { tree: String },
@@ -151,6 +155,35 @@ pub struct NetworkEntry {
     /// Response body for small JSON/text payloads (XHR/Fetch, <64KB). Absent for large or binary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+}
+
+/// A user interaction recorded in the browser (click, keydown, input, change,
+/// submit). Produced by the injected recorder script and parsed by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractionEntry {
+    /// "click" | "keydown" | "input" | "change" | "submit"
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(rename = "ts")]
+    pub timestamp_ms: u64,
+    pub url: String,
+    /// `location.pathname` → the "route" the user is on.
+    pub path: String,
+    /// Best-effort selector for the event target (see recorder script).
+    pub target: String,
+    pub tag: String,
+    /// Truncated target text.
+    pub text: String,
+    /// Truncated target value (inputs/selects).
+    pub value: String,
+    /// Keyboard key, for `keydown` events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Viewport coordinates for pointer events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

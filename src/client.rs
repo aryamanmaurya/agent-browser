@@ -227,6 +227,17 @@ pub fn print_response(resp: Response) {
                 }
             }
         }
+        Response::Interactions { entries } => {
+            if entries.is_empty() {
+                println!("=== INTERACTIONS (empty) ===");
+            } else {
+                println!("=== INTERACTIONS ({} entries) ===", entries.len());
+                for e in &entries {
+                    println!("{}", format_interaction(e));
+                }
+                println!("=== END INTERACTIONS ===");
+            }
+        }
         Response::Pdf { path, size_bytes } => {
             println!("=== PDF SAVED ===");
             println!("Path: {path}");
@@ -287,6 +298,40 @@ pub fn print_response(resp: Response) {
             println!("URL: {url}");
         }
     }
+}
+
+/// Format a single interaction entry in the LLM-friendly line format:
+/// `[type] HH:MM:SS.mmm target (tag) at (x,y) key: K value: "v" text: "t" → /path`
+fn format_interaction(e: &crate::protocol::InteractionEntry) -> String {
+    let t = format_time(e.timestamp_ms);
+    let mut line = format!("[{}] {} {} ({})", e.event_type, t, e.target, e.tag);
+    if let (Some(x), Some(y)) = (e.x, e.y) {
+        line.push_str(&format!(" at ({x}, {y})"));
+    }
+    if let Some(k) = &e.key {
+        if !k.is_empty() {
+            line.push_str(&format!(" key: {k}"));
+        }
+    }
+    if !e.value.is_empty() {
+        line.push_str(&format!(" value: \"{}\"", e.value));
+    }
+    if !e.text.is_empty() {
+        line.push_str(&format!(" text: \"{}\"", e.text));
+    }
+    if !e.path.is_empty() {
+        line.push_str(&format!(" → {}", e.path));
+    }
+    line
+}
+
+fn format_time(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let h = (total_secs / 3600) % 24;
+    let m = (total_secs / 60) % 60;
+    let s = total_secs % 60;
+    let millis = ms % 1000;
+    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
 }
 
 fn trim_text(s: &str, max: usize) -> String {

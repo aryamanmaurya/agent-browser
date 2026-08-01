@@ -122,6 +122,15 @@ enum Cmd {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Dump user input interactions (clicks, typing, form submits) recorded in
+    /// the browser since the last drain — including ones with no console/network
+    /// side effect (silent toggles, local state, unsubmitted typing).
+    Interactions {
+        /// Keep only entries where the event type equals this
+        /// (click | keydown | input | change | submit). Default: all.
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Get cookies for the current page.
     Cookies,
     /// Get localStorage entries (all, or one key).
@@ -290,6 +299,7 @@ fn build_request(cmd: Cmd) -> Request {
         },
         Cmd::Console => Request::Console,
         Cmd::Network { filter } => Request::Network { filter },
+        Cmd::Interactions { filter } => Request::Interactions { filter },
         Cmd::Cookies => Request::Cookies,
         Cmd::LocalStorage { key } => Request::LocalStorage { key },
         Cmd::Back => Request::Back,

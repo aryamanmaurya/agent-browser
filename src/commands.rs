@@ -3,11 +3,12 @@
 //! Each public function takes the live `Page` (and console buffer where
 //! relevant) and returns a `Response`. The daemon dispatches to these.
 
-use crate::protocol::{ConsoleEntry, Cookie, NetworkEntry, Response};
+use crate::protocol::{ConsoleEntry, Cookie, InteractionEntry, NetworkEntry, Response};
 use crate::selector::{js_quote, resolve, Resolved};
 use anyhow::Result;
 use serde_json::json;
 use base64::Engine;
+use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::Page;
@@ -23,6 +24,19 @@ pub type NetworkBuffer = Arc<Mutex<Vec<NetworkEntry>>>;
 
 /// Cap the network buffer to prevent unbounded growth on heavy pages.
 const NETWORK_BUFFER_CAP: usize = 1000;
+
+/// Shared interaction buffer. Stores the input events (clicks, typing, form
+/// submits) that happen in the browser — whoever performs them (the human in a
+/// headful window, or the agent via CLI). Drained on the `interactions` command.
+pub type InteractionBuffer = Arc<Mutex<Vec<InteractionEntry>>>;
+
+/// Cap the interaction buffer. `keydown`+`input` fire per keystroke, so this
+/// can fill fast on heavy typing sessions; the agent drains it periodically.
+const INTERACTION_BUFFER_CAP: usize = 2000;
+
+/// Marker string the injected recorder script prefixes each forwarded event
+/// with (as the first `console.debug` argument).
+pub const INTERACTION_MARKER: &str = "[agent-browser:interaction]";
 
 pub async fn navigate(page: &Page, url: &str, timeout_ms: Option<u64>) -> Response {
     let goto_fut = page.goto(url);
@@ -316,6 +330,18 @@ pub async fn network(network: &NetworkBuffer, filter: Option<&str>) -> Response 
     Response::Network { entries: filtered }
 }
 
+pub async fn interactions(buf: &InteractionBuffer, filter: Option<&str>) -> Response {
+    let entries = drain_interactions(buf);
+    let filtered = match filter {
+        Some(f) => entries
+            .into_iter()
+            .filter(|e| e.event_type == f)
+            .collect(),
+        None => entries,
+    };
+    Response::Interactions { entries: filtered }
+}
+
 pub async fn cookies(page: &Page) -> Response {
     match page.get_cookies().await {
         Ok(cookies) => {
@@ -446,6 +472,49 @@ pub fn push_network_entry(network: &NetworkBuffer, entry: NetworkEntry) {
         buf.remove(0);
     }
     buf.push(entry);
+}
+
+/// Push an interaction entry into the buffer, capping at INTERACTION_BUFFER_CAP
+/// (drop oldest), same as the network buffer.
+pub fn push_interaction_entry(buf: &InteractionBuffer, entry: InteractionEntry) {
+    let mut inner = buf.lock().unwrap();
+    if inner.len() >= INTERACTION_BUFFER_CAP {
+        inner.remove(0);
+    }
+    inner.push(entry);
+}
+
+/// Drain the interaction buffer (same semantics as `console` / `network`).
+pub fn drain_interactions(buf: &InteractionBuffer) -> Vec<InteractionEntry> {
+    let mut inner = buf.lock().unwrap();
+    let drained = inner.clone();
+    inner.clear();
+    drained
+}
+
+/// True when the console event's first argument is our interaction marker.
+/// Used by `spawn_console_listener` to keep marker spam out of the `console`
+/// command, and by `parse_interaction_console` to recognize marker events.
+pub fn is_interaction_marker(args: &[RemoteObject]) -> bool {
+    match args.first() {
+        Some(a) => {
+            let v = a.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+            let d = a.description.as_deref().unwrap_or("");
+            v == INTERACTION_MARKER || d == INTERACTION_MARKER
+        }
+        None => false,
+    }
+}
+
+/// Parse a marker console event (from the injected recorder script) into an
+/// `InteractionEntry`. Returns `None` for non-marker events or malformed JSON;
+/// never panics so the daemon's console subscription stays alive.
+pub fn parse_interaction_console(args: &[RemoteObject]) -> Option<InteractionEntry> {
+    if !is_interaction_marker(args) {
+        return None;
+    }
+    let json_text = args.get(1)?.value.as_ref()?.as_str()?;
+    serde_json::from_str::<InteractionEntry>(json_text).ok()
 }
 
 /// Update an existing network entry by request_id (for response/finish/fail events).

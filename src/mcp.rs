@@ -9,7 +9,7 @@
 //! as an MCP `image` content block, so multimodal models can actually *see*
 //! the page — not just read its text.
 
-use crate::commands::{self, ConsoleBuffer, NetworkBuffer};
+use crate::commands::{self, ConsoleBuffer, InteractionBuffer, NetworkBuffer};
 use crate::protocol::Response;
 use anyhow::{anyhow, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -73,13 +73,17 @@ pub async fn run(chrome_executable: PathBuf, headful: bool) -> Result<()> {
 
     let console_buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
     let network_buf: NetworkBuffer = Arc::new(Mutex::new(Vec::new()));
+    let interactions_buf: InteractionBuffer = Arc::new(Mutex::new(Vec::new()));
     crate::daemon::spawn_console_listener(&page, console_buf.clone());
     crate::daemon::spawn_network_listener(&page, network_buf.clone());
+    crate::daemon::spawn_interaction_listener(&page, interactions_buf.clone());
+    crate::daemon::inject_interaction_recorder(&page);
 
     let state = McpState {
         page,
         console: console_buf,
         network: network_buf,
+        interactions: interactions_buf,
         headful,
     };
 
@@ -127,6 +131,7 @@ struct McpState {
     page: Page,
     console: ConsoleBuffer,
     network: NetworkBuffer,
+    interactions: InteractionBuffer,
     headful: bool,
 }
 
@@ -268,6 +273,9 @@ fn handle_tools_list() -> Value {
             ])),
             tool("network", "Dump all network requests (success + failure) captured since the last drain. Each entry includes method, URL, status, MIME type, size, and failure info.", schema_obj_opt(&[
                 ("filter", "string", "Filter requests by URL substring (e.g. /api/).", false),
+            ])),
+            tool("interactions", "Dump user input interactions (clicks, typing, form submits) recorded in the browser since the last drain. Each entry includes the event type, target selector, coordinates, value, and the page path.", schema_obj_opt(&[
+                ("filter", "string", "Keep only entries where the event type equals this (click, keydown, input, change, submit).", false),
             ])),
             tool("back", "Go back in browser history.", schema_obj(&[])),
             tool("forward", "Go forward in browser history.", schema_obj(&[])),
@@ -442,6 +450,10 @@ async fn handle_tools_call(params: &Value, state: &McpState) -> Result<Value, Js
         "network" => {
             let filter = args.get("filter").and_then(|v| v.as_str()).map(|s| s.to_string());
             commands::network(&state.network, filter.as_deref()).await
+        }
+        "interactions" => {
+            let filter = args.get("filter").and_then(|v| v.as_str()).map(|s| s.to_string());
+            commands::interactions(&state.interactions, filter.as_deref()).await
         }
         "back" => commands::back(page).await,
         "forward" => commands::forward(page).await,
@@ -627,6 +639,34 @@ fn response_to_mcp_content(resp: &Response) -> (Vec<Value>, bool) {
                         n.method, n.url, status, mime, size, n.resource_type
                     ));
                 }
+            }
+            (vec![json!({"type": "text", "text": text})], false)
+        }
+        Response::Interactions { entries } => {
+            if entries.is_empty() {
+                return (vec![json!({"type": "text", "text": "No interactions captured."})], false);
+            }
+            let mut text = format!("{} interaction(s):\n", entries.len());
+            for e in entries {
+                let mut line = format!("[{}] {} {} ({})", e.event_type, e.timestamp_ms, e.target, e.tag);
+                if let (Some(x), Some(y)) = (e.x, e.y) {
+                    line.push_str(&format!(" at ({x}, {y})"));
+                }
+                if let Some(k) = &e.key {
+                    if !k.is_empty() {
+                        line.push_str(&format!(" key: {k}"));
+                    }
+                }
+                if !e.value.is_empty() {
+                    line.push_str(&format!(" value: \"{}\"", e.value));
+                }
+                if !e.text.is_empty() {
+                    line.push_str(&format!(" text: \"{}\"", e.text));
+                }
+                if !e.path.is_empty() {
+                    line.push_str(&format!(" -> {}", e.path));
+                }
+                text.push_str(&format!("  {line}\n"));
             }
             (vec![json!({"type": "text", "text": text})], false)
         }

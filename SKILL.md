@@ -88,6 +88,7 @@ After making any UI change during development:
 | `snapshot --text-only` | Skip screenshot |
 | `console` | Drain console logs |
 | `network [--filter /api/]` | Drain network requests (with response bodies) |
+| `interactions [--filter type]` | Drain real user input events (clicks, typing, form submits) |
 | `inspect <selector>` | Tag, attributes, computed styles, bbox, ARIA |
 | `accessibility` | ARIA tree as indented text |
 
@@ -182,6 +183,27 @@ iVBORw0KGgo...
 - `snapshot` shows only **failed** requests (peeked, not drained)
 - `network` drains ALL requests (success + failure)
 - `har` exports as HAR 1.2 (read-only, doesn't drain)
+
+## Interaction Recording
+
+Records **real DOM input events** in the browser — whoever performs them
+(human in a headful window, or the agent via CLI). Catches *silent*
+interactions with no console/network side effect: toggles, local state,
+unsubmitted typing.
+
+```bash
+agent-browser interactions                    # drain all captured events
+agent-browser interactions --filter click     # keep only clicks
+```
+
+- Captured: `click`, `keydown` (per key, includes key name), `input`/`change`
+  (values), `submit` (form submits)
+- Entries include event type, timestamp, target selector, coordinates, value,
+  and the route (`path`) read at event time (SPA-safe)
+- Buffer is shared across tabs, capped at 2000 (oldest dropped), drains on read
+- Marker entries are excluded from the `console` buffer (console stays clean)
+- No per-tab/frame id, Shadow DOM selectors best-effort, human vs agent sources
+  not distinguished in v1
 
 ## MCP Server Mode
 
