@@ -6,14 +6,12 @@ requests, record real user input, and inspect pages. Built on
 
 ## What it is
 
-The **"eyes during construction"** tool for agents. It does **not** assert; it
-**shows**. An agent builds UI, opens it in a visible (headful) window for a
-human to test by hand, and calls `snapshot` / `console` / `network` /
+**"An eye for coding agents"**. it**Allows** an agent see UI, 
+opens it in a visible (headful) window for a human to test by hand
+while capturing real time network calls `snapshot` / `console` / `network` /
 `interactions` to see what actually happened — including interactions with no
 console/network side effect.
 
-It pairs with any contract-based validator: agent-browser *shows* the current
-state, the validator *asserts* it.
 
 ## How it works
 
@@ -50,7 +48,7 @@ agent-browser --session all stop                        # stop everything
 - `--session <name>` picks the daemon (default: `default`; env: `AGENT_BROWSER_SESSION`)
 - `--headful` / `--visible` launches a visible window (newly-spawned daemons only)
 
-## Commands
+## Commands to use
 
 | Command | Description |
 |---|---|
@@ -247,3 +245,7 @@ src/
 ## License
 
 MIT
+
+## Personal notes
+
+umm, a tool like agent browser gives your coding agents the ability to test and validate their own output & less manual work.
